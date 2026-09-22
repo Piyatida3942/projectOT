@@ -12,7 +12,9 @@ def build_topology(bandwidth_mbps):
 
     h1 = net.addHost('h1', ip='10.0.0.1/24')
     h2 = net.addHost('h2', ip='10.0.0.2/24')
-    s1 = net.addSwitch('s1')
+    
+    # เพิ่ม failMode='standalone' เพื่อให้ Switch ทำงานแบบ L2 Switch ปกติโดยไม่ต้องมี Controller
+    s1 = net.addSwitch('s1', failMode='standalone')
 
     # จำกัด bandwidth ที่ link ตามค่าประจำกลุ่ม
     net.addLink(h1, s1, bw=bandwidth_mbps)
