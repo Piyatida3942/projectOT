@@ -1,0 +1,9 @@
+=== Parameter สำหรับกลุ่ม G33 ===
+  bandwidth_mbps: 5
+  token_rate_kbit: 1024
+  bucket_size_kbit: 32
+  burst_size_packets: 82
+  burst_interval_ms: 100
+  packet_size_bytes: 512
+  algorithm: leaky_bucket
+  latency_ms: 200
