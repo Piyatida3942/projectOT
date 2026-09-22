@@ -14,8 +14,7 @@ def send_burst(dst_ip, burst_size, packet_size, interval_ms, num_bursts=10):
             send(pkt, verbose=0)
         time.sleep(interval_ms / 1000)
 
-    print(f'สรุป: เรียก send สำเร็จ {ok}, error {errors}, '
-          f'รวม {ok + errors} (ควรเท่ากับ {burst_size * num_bursts})')
+
 
 
 if __name__ == '__main__':
