@@ -27,12 +27,12 @@ def send_burst(dst_ip, burst_size, packet_size, interval_ms, num_bursts=10):
 
     elapsed = time.time() - t_start #เวลาที่ใช้ทั้งหมด
     total = ok + errors
-    
+
     #แสดง output 
     print(f'สรุป: เรียก send สำเร็จ {ok}, error {errors}, '
           f'รวม {total} (ควรเท่ากับ {burst_size * num_bursts})')
     print(f'เวลาที่ใช้ทั้งหมด: {elapsed:.3f} วินาที '
-          f'(เฉลี่ย {elapsed / total * 1000:.2f} ms/packet)')
+          f'(เฉลี่ย {elapsed / total * 1000:.2f} ms/packet)') 
 
 
 if __name__ == '__main__':
