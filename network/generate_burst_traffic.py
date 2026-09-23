@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from scapy.all import IP, UDP, Raw, conf
+from scapy.all import IP, UDP, Raw, conf # send => conf
 import time
 import sys
 
@@ -8,16 +8,16 @@ def send_burst(dst_ip, burst_size, packet_size, interval_ms, num_bursts=10):
     payload = b'X' * packet_size
     pkt = IP(dst=dst_ip) / UDP(dport=5000) / Raw(load=payload)
 
-    s = conf.L3socket()  # เปิด socket ครั้งเดียว ใช้ส่งซ้ำตลอดทั้งโปรแกรม
-    ok = 0
-    errors = 0
-    t_start = time.time()
+    s = conf.L3socket()  # เปิด socket ครั้งเดียว ใช้ส่งซ้ำตลอดทั้งโปรแกรม *เวลาในการส่ง packet เร็วขึ้น*
+    ok = 0 #ส่ง packet สำเร็จ
+    errors = 0 #ส่ง packet ไม่สำเร็จ / error
+    t_start = time.time() 
     try:
         for burst_num in range(num_bursts):
             print(f'[Burst {burst_num + 1}] ส่ง {burst_size} packets')
             for _ in range(burst_size):
                 try:
-                    s.send(pkt)
+                    s.send(pkt)  #ส่งผ่าน socket เดิม
                     ok += 1
                 except OSError:
                     errors += 1
@@ -25,8 +25,10 @@ def send_burst(dst_ip, burst_size, packet_size, interval_ms, num_bursts=10):
     finally:
         s.close()
 
-    elapsed = time.time() - t_start
+    elapsed = time.time() - t_start #เวลาที่ใช้ทั้งหมด
     total = ok + errors
+    
+    #แสดง output 
     print(f'สรุป: เรียก send สำเร็จ {ok}, error {errors}, '
           f'รวม {total} (ควรเท่ากับ {burst_size * num_bursts})')
     print(f'เวลาที่ใช้ทั้งหมด: {elapsed:.3f} วินาที '
