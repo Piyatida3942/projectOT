@@ -1,7 +1,8 @@
 /*******************************************************************************
  * File Name    : main.c
- * Description  : FSM Conveyor System (LDR -> IR -> Delay Settle -> Evaluate)
+ * Description  : FSM Conveyor System - Non-Blocking (Fixed Reset & Reject LED)
  * Board        : Training Shield 1 Rev 02.00
+ * Hardware     : HW-480 Reject LED on PB8
  ******************************************************************************/
 
 #include <stdint.h>
@@ -12,36 +13,37 @@
 #include "stm32f4xx.h"
 
 /* --- Hardware Pin Mapping --- */
-#define LIGHT_SENSOR_PIN 1      // PA1  (LDR Light Sensor)
-#define POT_PIN          4      // PA4  (Potentiometer)
+#define LIGHT_SENSOR_PIN 1      // PA1  (LDR Light Sensor - ADC Channel 1)
+#define POT_PIN          4      // PA4  (Potentiometer - ADC Channel 4)
 
 /* --- LED Mapping --- */
 #define LED_STATUS_PIN   5      // PA5  (Blue - System Status)
 #define LED_RED_PIN      6      // PA6  (Red - Size S)
 #define LED_YELLOW_PIN   7      // PA7  (Yellow - Size M)
 #define LED_GREEN_PIN    6      // PB6  (Green - Size L)
+#define LED_REJECT_PIN   8      // PB8  (HW-480 Reject LED)
 
 /* --- Thresholds & Timers --- */
 #define THRESHOLD_STAGE1 1365
 #define THRESHOLD_STAGE2 2730
-
-#define LDR_THRESHOLD_DARK  2500  // ค่า ADC LDR เมื่อมีวัตถุบัง
+#define LDR_THRESHOLD_DARK  2500
 
 #define LED_HOLD_TIME_MS    500   // ระยะเวลาค้างไฟ LED (0.5 วินาที)
-#define IR_DEBOUNCE_MS      250   // กันสัญญาณรบกวนขอบกล่อง (250ms)
-#define IR_TIMEOUT_MS       3000  // เวลารอ IR สูงสุดหลัง LDR เจอ (3 วินาที)
-#define LDR_COOLDOWN_MS     1500  // ระยะเวลาพักก่อนรับ LDR ชิ้นถัดไป
+#define IR_DEBOUNCE_MS      250
+#define IR_COOLDOWN_MS      1200  // ป้องกันการรับค่า IR ซ้ำซ้อน
+#define LDR_TIMEOUT_MS      3000
+#define IR_SETTLE_TIME_MS   300
 
-// ** ใหม่: หน่วงเวลาหลังจาก IR ตรวจเจอ เพื่อให้กล่องเข้าที่เต็มใบ (ปรับเพิ่ม-ลดความช้าได้ตรงนี้) **
-#define IR_SETTLE_TIME_MS   300   // หน่วง 300 มิลลิวินาที
+/* --- Ring Buffer Config --- */
+#define TX_BUFFER_SIZE      512
 
 /* --- FSM States --- */
 typedef enum {
     STATE_IDLE,
     STATE_READY,
     STATE_RUNNING,
-    STATE_WAIT_IR,
-    STATE_SETTLE,       // State ใหม่สำหรับหน่วงเวลา IR
+    STATE_WAIT_LDR,
+    STATE_SETTLE,
     STATE_EVALUATE,
     STATE_PAUSED,
     STATE_REPORT
@@ -50,47 +52,38 @@ typedef enum {
 /* --- Global Variables --- */
 volatile SystemState current_state = STATE_IDLE;
 volatile uint32_t msTicks = 0;
-volatile uint16_t pot_adc_val = 0;
+
+volatile uint16_t adc_buffer[2];
 
 // Config Target
 volatile uint16_t target_S = 0, target_M = 0, target_L = 0;
 volatile uint32_t target_time = 0;
 
-// Accepted Count
+// Metrics
 volatile uint16_t count_S = 0, count_M = 0, count_L = 0;
-
-// Rejected & Error Count
 volatile uint16_t reject_S = 0, reject_M = 0, reject_L = 0;
-volatile uint16_t err_object_lost = 0;
-volatile uint16_t err_ghost_ir = 0;
-
-volatile uint32_t elapsed_time = 0;
-volatile uint32_t last_printed_sec = 0xFFFFFFFF;
+volatile uint16_t err_object_lost = 0, err_ghost_ir = 0;
+volatile uint32_t elapsed_time = 0, last_printed_sec = 0xFFFFFFFF;
 
 // Timers Control
-volatile uint32_t size_led_off_time = 0;
+volatile uint32_t size_led_off_time = 0, wait_ldr_start_time = 0, settle_start_time = 0;
 volatile uint8_t size_led_active = 0;
-volatile uint32_t wait_ir_start_time = 0;
-volatile uint32_t settle_start_time = 0;  // ตัวจับเวลาสำหรับ Settle
-volatile uint32_t last_ldr_read = 0;
-volatile uint32_t last_ldr_trigger = 0;
 
 // Button / Sensor Debounce Timers
-volatile uint32_t last_btn_start = 0;
-volatile uint32_t last_btn_pause = 0;
-volatile uint32_t last_btn_reset = 0;
-volatile uint32_t last_ir_trigger = 0;
+volatile uint32_t last_btn_start = 0, last_btn_pause = 0, last_btn_reset = 0, last_ir_trigger = 0;
 
-// Serial Buffer
+// Serial Buffers
 char rx_buffer[50];
-volatile uint8_t rx_index = 0;
-volatile uint8_t config_received = 0;
+volatile uint8_t rx_index = 0, config_received = 0;
+
+char tx_buffer[TX_BUFFER_SIZE];
+volatile uint16_t tx_head = 0, tx_tail = 0;
+
 char stringOut[250];
 
 /* --- Prototypes --- */
 void System_Init(void);
 static void UART2_TxString(char strOut[]);
-static uint16_t ADC_Read_Channel(uint8_t channel);
 static void Process_Evaluate(uint16_t pot_val);
 static void Reset_Metrics(void);
 static void Clear_Size_LEDs(void);
@@ -103,18 +96,18 @@ static void Parse_Config(char* str);
 int main(void)
 {
     System_Init();
-    UART2_TxString("\r\n=== System Booted (LDR -> IR -> Delay Settle Mode) ===\r\nWaiting for PC Config...\r\n");
+    UART2_TxString("\r\n=== System Booted (Non-Blocking Mode: IR -> LDR) ===\r\nWaiting for PC Config...\r\n");
 
     while (1)
     {
-        // 1. จัดการไฟแสดงผลลัพธ์
+        // 1. จัดการดับไฟแสดงผลลัพธ์ (LEDs) เมื่อครบเวลา
         if (size_led_active && msTicks >= size_led_off_time) {
             Clear_Size_LEDs();
             size_led_active = 0;
         }
 
-        // 2. ควบคุมไฟ Status LED
-        if (current_state == STATE_RUNNING || current_state == STATE_WAIT_IR || current_state == STATE_SETTLE) {
+        // 2. ควบคุมไฟ Status LED (PA5)
+        if (current_state == STATE_RUNNING || current_state == STATE_WAIT_LDR || current_state == STATE_SETTLE) {
             GPIOA->BSRR = (1 << LED_STATUS_PIN);
         } else if (current_state == STATE_PAUSED) {
             if ((msTicks / 250) % 2) GPIOA->BSRR = (1 << LED_STATUS_PIN);
@@ -123,7 +116,7 @@ int main(void)
             GPIOA->BSRR = (1 << (LED_STATUS_PIN + 16));
         }
 
-        // 3. FSM
+        // 3. Finite State Machine (FSM)
         switch (current_state)
         {
             case STATE_IDLE:
@@ -151,40 +144,29 @@ int main(void)
                     sprintf(stringOut, "[TIME REMAINING: %lu s]\r\n", target_time - elapsed_time);
                     UART2_TxString(stringOut);
                 }
-
-                if ((msTicks - last_ldr_read) > 50) {
-                    last_ldr_read = msTicks;
-                    if ((msTicks - last_ldr_trigger) > LDR_COOLDOWN_MS) {
-                        uint16_t ldr_val = ADC_Read_Channel(LIGHT_SENSOR_PIN);
-                        if (ldr_val > LDR_THRESHOLD_DARK) {
-                            wait_ir_start_time = msTicks;
-                            current_state = STATE_WAIT_IR;
-                            UART2_TxString("-> [LDR] Object detected. Waiting for IR...\r\n");
-                        }
-                    }
-                }
                 break;
 
-            case STATE_WAIT_IR:
-                if ((msTicks - wait_ir_start_time) > IR_TIMEOUT_MS) {
+            case STATE_WAIT_LDR:
+                if (adc_buffer[0] > LDR_THRESHOLD_DARK) {
+                    settle_start_time = msTicks;
+                    current_state = STATE_SETTLE;
+                    UART2_TxString("-> [LDR] Verified. Settling before evaluation...\r\n");
+                }
+                else if ((msTicks - wait_ldr_start_time) > LDR_TIMEOUT_MS) {
                     err_object_lost++;
-                    last_ldr_trigger = msTicks;
-                    UART2_TxString("-> [ERROR: OBJECT_LOST] IR verification timeout. Resuming...\r\n");
+                    UART2_TxString("-> [ERROR: OBJECT_LOST] LDR verification timeout. Resuming...\r\n");
                     current_state = STATE_RUNNING;
                 }
                 break;
 
             case STATE_SETTLE:
-                // รอจนกว่าจะครบเวลาหน่วง (Settle Time) เพื่อให้กล่องเข้าที่
                 if ((msTicks - settle_start_time) > IR_SETTLE_TIME_MS) {
                     current_state = STATE_EVALUATE;
                 }
                 break;
 
             case STATE_EVALUATE:
-                pot_adc_val = ADC_Read_Channel(POT_PIN);
-                Process_Evaluate(pot_adc_val);
-                last_ldr_trigger = msTicks; // เริ่มนับ Cooldown
+                Process_Evaluate(adc_buffer[1]);
                 current_state = STATE_RUNNING;
                 break;
 
@@ -209,36 +191,55 @@ int main(void)
 }
 
 /*==============================================================================
- * Helper Functions (ไม่เปลี่ยนแปลง)
+ * Helper Functions
  *============================================================================*/
-
-static uint16_t ADC_Read_Channel(uint8_t channel) {
-    ADC1->SQR3 = channel;
-    ADC1->CR2 |= ADC_CR2_SWSTART;
-    while (!(ADC1->SR & ADC_SR_EOC));
-    return (uint16_t)ADC1->DR;
-}
 
 static void Parse_Config(char* str) {
     target_S = target_M = target_L = target_time = 0;
     char* ptr = strchr(str, 'S');
-    if (ptr != NULL) {
-        sscanf(ptr, "S%hu,M%hu,L%hu,T%lu", &target_S, &target_M, &target_L, &target_time);
-    }
+    if (ptr != NULL) sscanf(ptr, "S%hu,M%hu,L%hu,T%lu", &target_S, &target_M, &target_L, &target_time);
 }
 
 static void Process_Evaluate(uint16_t pot_val) {
     Clear_Size_LEDs();
+
     if (pot_val < THRESHOLD_STAGE1) {
-        if (count_S < target_S) { count_S++; GPIOA->BSRR = (1 << LED_RED_PIN); sprintf(stringOut, "-> [DETECTED] Size S (ACCEPTED %d/%d)\r\n", count_S, target_S); }
-        else { reject_S++; GPIOA->BSRR = (1 << LED_RED_PIN); sprintf(stringOut, "-> [DETECTED] Size S (REJECTED %d/%d)\r\n", count_S, target_S); }
-    } else if (pot_val < THRESHOLD_STAGE2) {
-        if (count_M < target_M) { count_M++; GPIOA->BSRR = (1 << LED_YELLOW_PIN); sprintf(stringOut, "-> [DETECTED] Size M (ACCEPTED %d/%d)\r\n", count_M, target_M); }
-        else { reject_M++; GPIOA->BSRR = (1 << LED_YELLOW_PIN); sprintf(stringOut, "-> [DETECTED] Size M (REJECTED %d/%d)\r\n", count_M, target_M); }
-    } else {
-        if (count_L < target_L) { count_L++; GPIOB->BSRR = (1 << LED_GREEN_PIN); sprintf(stringOut, "-> [DETECTED] Size L (ACCEPTED %d/%d)\r\n", count_L, target_L); }
-        else { reject_L++; GPIOB->BSRR = (1 << LED_GREEN_PIN); sprintf(stringOut, "-> [DETECTED] Size L (REJECTED %d/%d)\r\n", count_L, target_L); }
+        if (count_S < target_S) {
+            count_S++;
+            GPIOA->BSRR = (1 << LED_RED_PIN);
+            sprintf(stringOut, "-> [DETECTED] Size S (ACCEPTED %d/%d)\r\n", count_S, target_S);
+        } else {
+            reject_S++;
+            GPIOA->BSRR = (1 << LED_RED_PIN);
+            GPIOB->BSRR = (1 << LED_REJECT_PIN); // เปิดไฟ Reject
+            sprintf(stringOut, "-> [DETECTED] Size S (REJECTED %d/%d)\r\n", count_S, target_S);
+        }
     }
+    else if (pot_val < THRESHOLD_STAGE2) {
+        if (count_M < target_M) {
+            count_M++;
+            GPIOA->BSRR = (1 << LED_YELLOW_PIN);
+            sprintf(stringOut, "-> [DETECTED] Size M (ACCEPTED %d/%d)\r\n", count_M, target_M);
+        } else {
+            reject_M++;
+            GPIOA->BSRR = (1 << LED_YELLOW_PIN);
+            GPIOB->BSRR = (1 << LED_REJECT_PIN); // เปิดไฟ Reject
+            sprintf(stringOut, "-> [DETECTED] Size M (REJECTED %d/%d)\r\n", count_M, target_M);
+        }
+    }
+    else {
+        if (count_L < target_L) {
+            count_L++;
+            GPIOB->BSRR = (1 << LED_GREEN_PIN);
+            sprintf(stringOut, "-> [DETECTED] Size L (ACCEPTED %d/%d)\r\n", count_L, target_L);
+        } else {
+            reject_L++;
+            GPIOB->BSRR = (1 << LED_GREEN_PIN);
+            GPIOB->BSRR = (1 << LED_REJECT_PIN); // เปิดไฟ Reject
+            sprintf(stringOut, "-> [DETECTED] Size L (REJECTED %d/%d)\r\n", count_L, target_L);
+        }
+    }
+
     UART2_TxString(stringOut);
     size_led_off_time = msTicks + LED_HOLD_TIME_MS;
     size_led_active = 1;
@@ -250,26 +251,33 @@ static void Reset_Metrics(void) {
     err_object_lost = err_ghost_ir = 0;
     elapsed_time = 0;
     last_printed_sec = 0xFFFFFFFF;
+    Clear_Size_LEDs(); // ดับไฟทุกดวงทันทีเมื่อล้างค่า
 }
 
 static void Clear_Size_LEDs(void) {
     GPIOA->BSRR = (1 << (LED_RED_PIN + 16)) | (1 << (LED_YELLOW_PIN + 16));
-    GPIOB->BSRR = (1 << (LED_GREEN_PIN + 16));
+    GPIOB->BSRR = (1 << (LED_GREEN_PIN + 16)) | (1 << (LED_REJECT_PIN + 16));
 }
 
+// ปรับแก้เป็น Non-blocking 100%: เปิดไฟแล้วฝากให้ลูป main ดับไฟเองตามเวลา
 static void Flash_All_LEDs(void) {
     GPIOA->BSRR = (1 << LED_STATUS_PIN) | (1 << LED_RED_PIN) | (1 << LED_YELLOW_PIN);
-    GPIOB->BSRR = (1 << LED_GREEN_PIN);
-    for(volatile int i = 0; i < 600000; i++);
-    GPIOA->BSRR = (1 << (LED_STATUS_PIN + 16)) | (1 << (LED_RED_PIN + 16)) | (1 << (LED_YELLOW_PIN + 16));
-    GPIOB->BSRR = (1 << (LED_GREEN_PIN + 16));
+    GPIOB->BSRR = (1 << LED_GREEN_PIN) | (1 << LED_REJECT_PIN);
+    size_led_off_time = msTicks + 200; // กำหนดให้ติดค้างไว้ 200ms
+    size_led_active = 1;               // แจ้งเตือน main() ให้มาคอยดับไฟ
 }
 
 static void UART2_TxString(char strOut[]){
-    for (uint8_t idx = 0; strOut[idx] != '\0'; idx++){
-        while((USART2->SR & USART_SR_TXE) == 0);
-        USART2->DR = strOut[idx];
+    for (uint16_t idx = 0; strOut[idx] != '\0'; idx++) {
+        uint16_t next_head = (tx_head + 1) % TX_BUFFER_SIZE;
+        if (next_head != tx_tail) {
+            tx_buffer[tx_head] = strOut[idx];
+            tx_head = next_head;
+        } else {
+            break;
+        }
     }
+    USART2->CR1 |= USART_CR1_TXEIE;
 }
 
 /*==============================================================================
@@ -277,14 +285,16 @@ static void UART2_TxString(char strOut[]){
  *============================================================================*/
 void System_Init(void) {
     SysTick_Config(16000000 / 1000);
-    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN);
+
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_DMA2EN);
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
     RCC->APB2ENR |= (RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADC1EN);
 
     GPIOA->MODER &= ~((3 << (LED_STATUS_PIN * 2)) | (3 << (LED_RED_PIN * 2)) | (3 << (LED_YELLOW_PIN * 2)));
     GPIOA->MODER |= ((1 << (LED_STATUS_PIN * 2)) | (1 << (LED_RED_PIN * 2)) | (1 << (LED_YELLOW_PIN * 2)));
-    GPIOB->MODER &= ~(3 << (LED_GREEN_PIN * 2));
-    GPIOB->MODER |= (1 << (LED_GREEN_PIN * 2));
+
+    GPIOB->MODER &= ~((3 << (LED_GREEN_PIN * 2)) | (3 << (LED_REJECT_PIN * 2)));
+    GPIOB->MODER |= ((1 << (LED_GREEN_PIN * 2)) | (1 << (LED_REJECT_PIN * 2)));
     Clear_Size_LEDs();
 
     GPIOA->MODER |= (3 << (LIGHT_SENSOR_PIN * 2)) | (3 << (POT_PIN * 2));
@@ -296,15 +306,6 @@ void System_Init(void) {
     GPIOC->MODER &= ~GPIO_MODER_MODER10;
     GPIOC->PUPDR &= ~GPIO_PUPDR_PUPD10;
     GPIOC->PUPDR |= (1 << GPIO_PUPDR_PUPD10_Pos);
-
-    GPIOA->MODER &= ~(GPIO_MODER_MODER2 | GPIO_MODER_MODER3);
-    GPIOA->MODER |= ((2 << GPIO_MODER_MODER2_Pos) | (2 << GPIO_MODER_MODER3_Pos));
-    GPIOA->AFR[0] &= ~(GPIO_AFRL_AFRL2 | GPIO_AFRL_AFRL3);
-    GPIOA->AFR[0] |= ((7 << GPIO_AFRL_AFSEL2_Pos) | (7 << GPIO_AFRL_AFSEL3_Pos));
-
-    USART2->BRR = 0x8B;
-    USART2->CR1 |= (USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE);
-    NVIC_EnableIRQ(USART2_IRQn);
 
     SYSCFG->EXTICR[0] &= ~(SYSCFG_EXTICR1_EXTI3); SYSCFG->EXTICR[0] |= SYSCFG_EXTICR1_EXTI3_PB;
     SYSCFG->EXTICR[1] &= ~(SYSCFG_EXTICR2_EXTI4); SYSCFG->EXTICR[1] |= SYSCFG_EXTICR2_EXTI4_PB;
@@ -318,9 +319,32 @@ void System_Init(void) {
     NVIC_EnableIRQ(EXTI3_IRQn); NVIC_EnableIRQ(EXTI4_IRQn);
     NVIC_EnableIRQ(EXTI9_5_IRQn); NVIC_EnableIRQ(EXTI15_10_IRQn);
 
+    GPIOA->MODER &= ~(GPIO_MODER_MODER2 | GPIO_MODER_MODER3);
+    GPIOA->MODER |= ((2 << GPIO_MODER_MODER2_Pos) | (2 << GPIO_MODER_MODER3_Pos));
+    GPIOA->AFR[0] &= ~(GPIO_AFRL_AFRL2 | GPIO_AFRL_AFRL3);
+    GPIOA->AFR[0] |= ((7 << GPIO_AFRL_AFSEL2_Pos) | (7 << GPIO_AFRL_AFSEL3_Pos));
+
+    USART2->BRR = 0x8B;
+    USART2->CR1 |= (USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE);
+    NVIC_EnableIRQ(USART2_IRQn);
+
+    DMA2_Stream0->CR = 0;
+    while(DMA2_Stream0->CR & DMA_SxCR_EN);
+    DMA2_Stream0->PAR = (uint32_t)&ADC1->DR;
+    DMA2_Stream0->M0AR = (uint32_t)adc_buffer;
+    DMA2_Stream0->NDTR = 2;
+    DMA2_Stream0->CR |= (0 << 25) | (1 << 13) | (1 << 11) | (1 << 10) | (1 << 8);
+    DMA2_Stream0->CR |= DMA_SxCR_EN;
+
     ADC1->CR2 &= ~ADC_CR2_ADON;
+    ADC1->CR1 |= ADC_CR1_SCAN;
+    ADC1->CR2 |= ADC_CR2_CONT | ADC_CR2_DMA | ADC_CR2_DDS;
+    ADC1->SQR1 |= (1 << 20);
+    ADC1->SQR3 = (LIGHT_SENSOR_PIN << 0) | (POT_PIN << 5);
     ADC1->SMPR2 |= (7 << (LIGHT_SENSOR_PIN * 3)) | (7 << (POT_PIN * 3));
+
     ADC1->CR2 |= ADC_CR2_ADON;
+    ADC1->CR2 |= ADC_CR2_SWSTART;
 }
 
 /*==============================================================================
@@ -329,7 +353,7 @@ void System_Init(void) {
 
 void SysTick_Handler(void) {
     msTicks++;
-    if ((current_state == STATE_RUNNING || current_state == STATE_WAIT_IR || current_state == STATE_SETTLE) && (msTicks % 1000 == 0)) {
+    if ((current_state == STATE_RUNNING || current_state == STATE_WAIT_LDR || current_state == STATE_SETTLE) && (msTicks % 1000 == 0)) {
         elapsed_time++;
     }
 }
@@ -341,15 +365,35 @@ void USART2_IRQHandler(void) {
             if (rx_index > 0) { rx_buffer[rx_index] = '\0'; rx_index = 0; config_received = 1; }
         } else { if (rx_index < 49) rx_buffer[rx_index++] = rx_data; }
     }
+
+    if ((USART2->SR & USART_SR_TXE) && (USART2->CR1 & USART_CR1_TXEIE)) {
+        if (tx_head != tx_tail) {
+            USART2->DR = tx_buffer[tx_tail];
+            tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
+        } else {
+            USART2->CR1 &= ~USART_CR1_TXEIE;
+        }
+    }
 }
 
+// EXTI3: Reset Button (ปลอดคำสั่งค้างลูป)
 void EXTI3_IRQHandler(void) {
     if (EXTI->PR & EXTI_PR_PR3) {
         if ((msTicks - last_btn_reset) > 300) {
-            last_btn_reset = msTicks; Flash_All_LEDs();
+            last_btn_reset = msTicks;
+
+            Flash_All_LEDs(); // สั่งกระพริบไฟแบบ Non-blocking
+
             if (current_state == STATE_IDLE || current_state == STATE_READY) {
-                Reset_Metrics(); target_S = target_M = target_L = target_time = 0; current_state = STATE_IDLE; UART2_TxString("\r\n[RESET] Cleared!\r\n");
-            } else { UART2_TxString("\r\n[RESET] Jumped to Report!\r\n"); current_state = STATE_REPORT; }
+                Reset_Metrics();
+                target_S = target_M = target_L = target_time = 0;
+                current_state = STATE_IDLE;
+                UART2_TxString("\r\n[RESET] Cleared!\r\n");
+            } else {
+                Clear_Size_LEDs();
+                UART2_TxString("\r\n[RESET] Jumped to Report!\r\n");
+                current_state = STATE_REPORT; // กระโดดไปออก Report ได้ทันที ไม่ค้างแล้ว
+            }
         }
         EXTI->PR |= EXTI_PR_PR3;
     }
@@ -369,7 +413,7 @@ void EXTI9_5_IRQHandler(void) {
     if (EXTI->PR & EXTI_PR_PR5) {
         if ((msTicks - last_btn_pause) > 300) {
             last_btn_pause = msTicks;
-            if (current_state == STATE_RUNNING || current_state == STATE_WAIT_IR || current_state == STATE_SETTLE) {
+            if (current_state == STATE_RUNNING || current_state == STATE_WAIT_LDR || current_state == STATE_SETTLE) {
                 current_state = STATE_PAUSED; UART2_TxString("\r\n[PAUSED]\r\n");
             }
             else if (current_state == STATE_PAUSED) {
@@ -380,23 +424,18 @@ void EXTI9_5_IRQHandler(void) {
     }
 }
 
-// PC10: IR SENSOR (Falling Edge Interrupt)
 void EXTI15_10_IRQHandler(void)
 {
     if (EXTI->PR & EXTI_PR_PR10) {
         EXTI->PR |= EXTI_PR_PR10;
 
-        if ((msTicks - last_ir_trigger) > IR_DEBOUNCE_MS) {
+        if ((msTicks - last_ir_trigger) > IR_COOLDOWN_MS) {
             last_ir_trigger = msTicks;
 
-            if (current_state == STATE_WAIT_IR) {
-                // แทนที่จะประเมินผลทันที ให้ไปรอใน STATE_SETTLE ก่อน
-                settle_start_time = msTicks;
-                current_state = STATE_SETTLE;
-                UART2_TxString("-> [IR] Confirmed. Settling before evaluation...\r\n");
-            } else if (current_state == STATE_RUNNING) {
-                err_ghost_ir++;
-                UART2_TxString("-> [ERROR: GHOST_IR] IR triggered without LDR.\r\n");
+            if (current_state == STATE_RUNNING) {
+                wait_ldr_start_time = msTicks;
+                current_state = STATE_WAIT_LDR;
+                UART2_TxString("-> [IR] Object detected (Input). Waiting for LDR...\r\n");
             }
         }
     }
