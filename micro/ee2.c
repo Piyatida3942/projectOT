@@ -1,19 +1,27 @@
 /*******************************************************************************
  * File Name    : main2_manual_test.c
- * Description  : Conveyor Simulation - Manual IR Test + Servo Simulation
+ * Description  : Conveyor Simulation - Merged IR/Fault/Emergency System
  * Board        : NUCLEO-F411RE / Training Shield 1 Rev 02.00
  *
- * Current test hardware:
- *   PA10 = Manual Trigger (simulates future IR receiver)
- *   PC12 = External Emergency Stop button module
+ * Current hardware:
+ *   PC10 = IR input (EXTI10)
+ *   PA10 = External Emergency Stop button module (TIM1_CH3 interrupt)
  *   LDR  = PA1 / ADC channel 1
  *   Pot  = PA4 / ADC channel 4
  *   Servo is NOT connected yet. Reject action is simulated by LED_REJECT_PIN.
  *
- * Future hardware:
- *   Replace PA10 manual trigger with IR receiver output.
- *   External Emergency button module remains on PC12: VCC=3.3V, OUT=PC12, GND=GND.
+ * Current behavior:
+ *   FAULT acts like an automatic pause: PAUSE resumes, RESET reports then IDLE;
+ *   if FAULT lasts too long, system goes to REPORT automatically.
+ *   Emergency is triggered by the external Emergency button on PA10.
+ *
+ * IR/LDR detection:
+ *   IR uses the same EXTI/falling-edge detection logic as the latest friend version.
+ *   LDR uses the same threshold logic (ADC > 2000 = detected/dark).
+ *   PA10 uses TIM1_CH3 input-capture interrupt so PC10 can keep EXTI10.
+ *   External Emergency button module: VCC=3.3V, OUT=PA10, GND=GND.
  *   Replace Servo_SimReject() with real Servo PWM control.
+ *   Timing: IR->LDR wait = 5 s; manual PAUSE/Fault timeout = 15 s.
  *******************************************************************************/
 
 #include <stdint.h>
@@ -33,24 +41,33 @@
 #define LED_YELLOW_PIN   7      // PA7 : M
 #define LED_GREEN_PIN    6      // PB6 : L
 #define LED_REJECT_PIN   8      // PB8 : reject / servo simulation
+#define LED_WAIT_LDR_PIN 9      // PB9 : ON while IR detected and waiting for LDR
 
 /* --- Manual test input / future IR input --- */
-#define MANUAL_IR_TEST_PIN 10   // PA10 / EXTI10
-#define EMERGENCY_BUTTON_PIN 12 // PC12 / EXTI12, external button module OUT
+#define IR_PIN               10  // PC10: IR sensor output (EXTI10)
+#define EMERGENCY_BUTTON_PIN 10  // PA10: external Emergency button OUT (TIM1_CH3)
 
 /* --- Thresholds --- */
 #define THRESHOLD_STAGE1      1365
 #define THRESHOLD_STAGE2      2730
-#define LDR_THRESHOLD_DARK    2500
+#define LDR_THRESHOLD_DARK    2000
+#define LDR_DARK_WHEN_HIGH     1
+
+#if LDR_DARK_WHEN_HIGH
+#define IS_LDR_DARK()          (adc_buffer[0] > LDR_THRESHOLD_DARK)
+#else
+#define IS_LDR_DARK()          (adc_buffer[0] < LDR_THRESHOLD_DARK)
+#endif
 
 /* --- Timing --- */
 #define BUTTON_DEBOUNCE_MS    300
 #define IR_COOLDOWN_MS        1200
-#define LDR_TIMEOUT_MS        3000
+#define LDR_TIMEOUT_MS        5000      // after IR, wait up to 5 s for LDR
 #define LDR_CLEAR_TIMEOUT_MS  3000
 #define SETTLE_TIME_MS        300
 #define ROUTE_TIME_MS         1000
-#define PAUSE_TIMEOUT_MS      30000
+#define PAUSE_TIMEOUT_MS      15000      // manual pause timeout = 15 s
+#define FAULT_TIMEOUT_MS      15000      // fault timeout = 15 s
 #define LED_HOLD_TIME_MS      500
 
 /* --- UART TX ring buffer --- */
@@ -100,8 +117,8 @@ volatile uint32_t target_time = 0;
 
 volatile uint16_t count_S = 0, count_M = 0, count_L = 0;
 volatile uint16_t reject_S = 0, reject_M = 0, reject_L = 0;
-volatile uint16_t err_object_lost = 0;
-volatile uint16_t err_ghost_ldr = 0;
+volatile uint16_t err_ir_fault = 0;   /* IR saw object, but LDR did not confirm */
+volatile uint16_t err_ldr_fault = 0;  /* LDR saw object without previous IR */
 volatile uint16_t err_stuck = 0;
 volatile uint8_t last_fault_reason = 0;
 
@@ -113,11 +130,14 @@ volatile uint32_t settle_start_time = 0;
 volatile uint32_t route_start_time = 0;
 volatile uint32_t ldr_clear_start_time = 0;
 volatile uint32_t pause_start_time = 0;
+volatile uint32_t fault_start_time = 0;
 
 volatile uint32_t last_btn_start = 0;
 volatile uint32_t last_btn_pause = 0;
 volatile uint32_t last_btn_reset = 0;
+volatile uint32_t last_btn_emergency = 0;
 volatile uint32_t last_manual_trigger = 0;
+volatile uint8_t ir_event_pending = 0;
 
 volatile uint32_t size_led_off_time = 0;
 volatile uint8_t size_led_active = 0;
@@ -163,15 +183,23 @@ static void Start_Size_Result_LED(PackageSize size, PackageDecision decision);
 static void Update_Size_Result_LED(void);
 static void Start_Reset_Flash(void);
 static void Set_Emergency_LEDs(void);
+static void Wait_LDR_LED_On(void);
+static void Wait_LDR_LED_Off(void);
+static void Reject_LED_On(void);
+static void Reject_LED_Off(void);
 static void Parse_Config(char* str);
 static uint8_t Targets_Complete(void);
 static void Enter_Fault(uint8_t reason);
+static void Resume_From_Fault(void);
+static void Enter_Emergency(void);
 static void Servo_SimAccept(void);
 static void Servo_SimReject(void);
 static void Servo_SimNormal(void);
 static void Pause_System(void);
 static void Resume_System(void);
 static void Reset_To_Idle(void);
+static void Process_IR_Event(void);
+static PackageSize Get_Pot_Size(uint16_t pot_val);
 
 /*==============================================================================
  * Main
@@ -181,7 +209,7 @@ int main(void)
     System_Init();
 
     UART2_TxString("\r\n=== Conveyor Simulation ===\r\n");
-    UART2_TxString("Manual PA10 = simulate IR input. External Emergency button module = OUT -> PC12.\r\n");
+    UART2_TxString("IR = PC10. External Emergency button = OUT -> PA10.\r\n");
     UART2_TxString("Waiting for PC config...\r\n");
 
     while (1)
@@ -198,30 +226,46 @@ int main(void)
         /* Result LEDs are independent from the status LED. */
         Update_Size_Result_LED();
 
-        /* Status LED */
+        /* Main consumes the IR event raised by the PC10 EXTI interrupt. */
+        if (ir_event_pending) {
+            ir_event_pending = 0;
+            Process_IR_Event();
+        }
+
+            /* Status LED */
         if (!reset_flash_active) {
             if (current_state == STATE_EMERGENCY) {
                 /* Emergency: every LED stays ON while in EMERGENCY. */
                 Set_All_LEDs();
             }
-            else if (current_state == STATE_RUNNING ||
-                     current_state == STATE_WAIT_LDR ||
-                     current_state == STATE_SETTLE ||
-                     current_state == STATE_EVALUATE ||
-                     current_state == STATE_ROUTE_ACCEPT ||
-                     current_state == STATE_ROUTE_REJECT ||
-                     current_state == STATE_WAIT_LDR_CLEAR) {
+            else if (current_state == STATE_WAIT_LDR) {
+                /* IR detected: PA5 remains ON and PB9 indicates waiting for LDR. */
                 GPIOA->BSRR = (1 << LED_STATUS_PIN);
-            }
-            else if (current_state == STATE_PAUSED) {
-                /* Pause: PA5 blinks. */
-                if ((msTicks / 250) % 2)
-                    GPIOA->BSRR = (1 << LED_STATUS_PIN);
-                else
-                    GPIOA->BSRR = (1 << (LED_STATUS_PIN + 16));
+                Wait_LDR_LED_On();
             }
             else {
-                GPIOA->BSRR = (1 << (LED_STATUS_PIN + 16));
+                /* PB9 is only for the IR -> LDR waiting state. */
+                Wait_LDR_LED_Off();
+
+                if (current_state == STATE_RUNNING ||
+                    current_state == STATE_SETTLE ||
+                    current_state == STATE_EVALUATE ||
+                    current_state == STATE_ROUTE_ACCEPT ||
+                    current_state == STATE_ROUTE_REJECT ||
+                    current_state == STATE_WAIT_LDR_CLEAR) {
+                    /* Running: PA5 stays ON. */
+                    GPIOA->BSRR = (1 << LED_STATUS_PIN);
+                }
+                else if (current_state == STATE_PAUSED || current_state == STATE_FAULT) {
+                    /* Pause/Fault: PA5 blinks. */
+                    if ((msTicks / 250) % 2)
+                        GPIOA->BSRR = (1 << LED_STATUS_PIN);
+                    else
+                        GPIOA->BSRR = (1 << (LED_STATUS_PIN + 16));
+                }
+                else {
+                    GPIOA->BSRR = (1 << (LED_STATUS_PIN + 16));
+                }
             }
         }
 
@@ -263,19 +307,18 @@ int main(void)
                  * No package should reach LDR before the manual/IR input.
                  * This is the "LDR detected without previous IR" fault.
                  */
-                if (!package_active && adc_buffer[0] > LDR_THRESHOLD_DARK) {
+                if (!package_active && IS_LDR_DARK()) {
                     Enter_Fault(2);
                 }
                 break;
 
             case STATE_WAIT_LDR:
-                if (adc_buffer[0] > LDR_THRESHOLD_DARK) {
+                if (IS_LDR_DARK()) {
                     settle_start_time = msTicks;
                     current_state = STATE_SETTLE;
                     UART2_TxString("-> [LDR] Package confirmed at sorting point.\r\n");
                 }
                 else if ((msTicks - wait_ldr_start_time) >= LDR_TIMEOUT_MS) {
-                    err_object_lost++;
                     Enter_Fault(1);
                 }
                 break;
@@ -320,7 +363,7 @@ int main(void)
                 break;
 
             case STATE_WAIT_LDR_CLEAR:
-                if (adc_buffer[0] <= LDR_THRESHOLD_DARK) {
+                if (!IS_LDR_DARK()) {
                     if (current_decision == DECISION_ACCEPT) {
                         if (current_size == SIZE_S) count_S++;
                         else if (current_size == SIZE_M) count_M++;
@@ -358,9 +401,18 @@ int main(void)
                 break;
 
             case STATE_FAULT:
+                /* FAULT behaves like an automatic pause.
+                 * Resume with PAUSE button, or let the timeout go to REPORT.
+                 */
+                if ((msTicks - fault_start_time) >= FAULT_TIMEOUT_MS) {
+                    UART2_TxString("\r\n[FAULT TIMEOUT] Fault lasted too long. Going to report before reset.\r\n");
+                    Start_Reset_Flash();
+                    current_state = STATE_REPORT;
+                }
                 break;
 
             case STATE_EMERGENCY:
+                /* Emergency stays stopped until RESET is pressed. */
                 break;
 
             case STATE_COMPLETE:
@@ -374,12 +426,12 @@ int main(void)
                             "\r\n=== TEST REPORT ===\r\n"
                             "ACCEPTED -> S:%d/%d, M:%d/%d, L:%d/%d\r\n"
                             "REJECTED -> S:%d, M:%d, L:%d\r\n"
-                            "ERRORS   -> Lost:%d, Ghost:%d, Stuck:%d\r\n"
+                            "ERRORS   -> IR Fault:%d, LDR Fault:%d, Stuck:%d\r\n"
                             "ELAPSED TIME -> %lu s\r\n"
                             "===================\r\n",
                             count_S, target_S, count_M, target_M, count_L, target_L,
                             reject_S, reject_M, reject_L,
-                            err_object_lost, err_ghost_ldr, err_stuck,
+                            err_ir_fault, err_ldr_fault, err_stuck,
                             elapsed_time);
                     UART2_TxString(stringOut);
                     report_printed = 1;
@@ -395,19 +447,31 @@ int main(void)
 }
 
 /*==============================================================================
+ * IR / Pot helpers
+ *============================================================================*/
+static void Process_IR_Event(void)
+{
+    if (current_state != STATE_RUNNING || package_active) return;
+
+    package_active = 1;
+    wait_ldr_start_time = msTicks;
+    current_state = STATE_WAIT_LDR;
+    UART2_TxString("-> [IR] Package input detected at PC10. Waiting for LDR confirmation...\r\n");
+}
+
+static PackageSize Get_Pot_Size(uint16_t pot_val)
+{
+    if (pot_val < THRESHOLD_STAGE1) return SIZE_S;
+    if (pot_val < THRESHOLD_STAGE2) return SIZE_M;
+    return SIZE_L;
+}
+
+/*==============================================================================
  * Package evaluation
  *============================================================================*/
 static void Process_Evaluate(uint16_t pot_val)
 {
-    if (pot_val < THRESHOLD_STAGE1) {
-        current_size = SIZE_S;
-    }
-    else if (pot_val < THRESHOLD_STAGE2) {
-        current_size = SIZE_M;
-    }
-    else {
-        current_size = SIZE_L;
-    }
+    current_size = Get_Pot_Size(pot_val);
 
     if (current_size == SIZE_S) {
         current_decision = (count_S < target_S) ? DECISION_ACCEPT : DECISION_REJECT;
@@ -462,22 +526,45 @@ static void Enter_Fault(uint8_t reason)
 {
     package_active = 0;
     last_fault_reason = reason;
+    fault_start_time = msTicks;
+    resume_state = STATE_RUNNING;
+
     Servo_SimNormal();
     Clear_All_LEDs();
-    GPIOB->BSRR = (1 << LED_REJECT_PIN);
 
     if (reason == 1) {
-        UART2_TxString("\r\n[FAULT] OBJECT LOST: IR/manual input happened but LDR did not confirm.\r\n");
+        err_ir_fault++;
+        UART2_TxString("\r\n[FAULT][IR] Object detected by IR, but LDR did not confirm within timeout.\r\n");
     }
     else if (reason == 2) {
-        err_ghost_ldr++;
-        UART2_TxString("\r\n[FAULT] UNEXPECTED LDR: LDR detected without previous IR/manual input.\r\n");
+        err_ldr_fault++;
+        UART2_TxString("\r\n[FAULT][LDR] LDR detected an object without a preceding IR detection.\r\n");
     }
     else {
         UART2_TxString("\r\n[FAULT] OBJECT STUCK: package did not leave LDR point.\r\n");
     }
 
+    UART2_TxString("[FAULT] System paused automatically. Press PAUSE to resume or RESET for report.\r\n");
     current_state = STATE_FAULT;
+}
+
+static void Resume_From_Fault(void)
+{
+    fault_start_time = 0;
+    last_printed_sec = 0xFFFFFFFF;
+    current_state = STATE_RUNNING;
+    UART2_TxString("\r\n[FAULT RESUMED] System back to RUNNING. Waiting for next package...\r\n");
+}
+
+static void Enter_Emergency(void)
+{
+    package_active = 0;
+    Servo_SimNormal();
+    led_pattern = LED_PATTERN_NONE;
+    reset_flash_active = 0;
+    Set_All_LEDs();
+    current_state = STATE_EMERGENCY;
+    UART2_TxString("\r\n[EMERGENCY] Emergency button pressed. System stopped. Press RESET after fixing the problem.\r\n");
 }
 
 static void Pause_System(void)
@@ -551,8 +638,8 @@ static void Reset_Metrics(void)
 {
     count_S = count_M = count_L = 0;
     reject_S = reject_M = reject_L = 0;
-    err_object_lost = 0;
-    err_ghost_ldr = 0;
+    err_ir_fault = 0;
+    err_ldr_fault = 0;
     err_stuck = 0;
     elapsed_time = 0;
     last_printed_sec = 0xFFFFFFFF;
@@ -560,8 +647,10 @@ static void Reset_Metrics(void)
     current_decision = DECISION_ACCEPT;
     current_size = SIZE_S;
     resume_state = STATE_RUNNING;
-    last_manual_trigger = 0;
+    last_manual_trigger = (uint32_t)(0 - IR_COOLDOWN_MS);
+    last_btn_emergency = 0;
     pause_start_time = 0;
+    fault_start_time = 0;
     wait_ldr_start_time = 0;
     settle_start_time = 0;
     route_start_time = 0;
@@ -571,6 +660,7 @@ static void Reset_Metrics(void)
     reset_flash_active = 0;
     reset_flash_end_time = 0;
     report_printed = 0;
+    ir_event_pending = 0;
 }
 
 static void Clear_All_LEDs(void)
@@ -579,7 +669,8 @@ static void Clear_All_LEDs(void)
                   (1 << (LED_RED_PIN + 16)) |
                   (1 << (LED_YELLOW_PIN + 16));
     GPIOB->BSRR = (1 << (LED_GREEN_PIN + 16)) |
-                  (1 << (LED_REJECT_PIN + 16));
+                  (1 << (LED_REJECT_PIN + 16)) |
+                  (1 << (LED_WAIT_LDR_PIN + 16));
 }
 
 static void Set_All_LEDs(void)
@@ -588,7 +679,36 @@ static void Set_All_LEDs(void)
                   (1 << LED_RED_PIN) |
                   (1 << LED_YELLOW_PIN);
     GPIOB->BSRR = (1 << LED_GREEN_PIN) |
-                  (1 << LED_REJECT_PIN);
+                  (1 << LED_REJECT_PIN) |
+                  (1 << LED_WAIT_LDR_PIN);
+}
+
+static void Wait_LDR_LED_On(void)
+{
+    GPIOB->BSRR = (1 << LED_WAIT_LDR_PIN);
+}
+
+static void Wait_LDR_LED_Off(void)
+{
+    GPIOB->BSRR = (1 << (LED_WAIT_LDR_PIN + 16));
+}
+
+static void Reject_LED_On(void)
+{
+#if REJECT_LED_ACTIVE_LOW
+    GPIOB->BSRR = (1 << (LED_REJECT_PIN + 16));
+#else
+    GPIOB->BSRR = (1 << LED_REJECT_PIN);
+#endif
+}
+
+static void Reject_LED_Off(void)
+{
+#if REJECT_LED_ACTIVE_LOW
+    GPIOB->BSRR = (1 << LED_REJECT_PIN);
+#else
+    GPIOB->BSRR = (1 << (LED_REJECT_PIN + 16));
+#endif
 }
 
 static void Clear_Size_LEDs(void)
@@ -596,6 +716,7 @@ static void Clear_Size_LEDs(void)
     GPIOA->BSRR = (1 << (LED_RED_PIN + 16)) |
                   (1 << (LED_YELLOW_PIN + 16));
     GPIOB->BSRR = (1 << (LED_GREEN_PIN + 16));
+    Reject_LED_Off();
 }
 
 static void Set_Size_LED_Output(PackageSize size, uint8_t on)
@@ -625,6 +746,11 @@ static void Start_Size_Result_LED(PackageSize size, PackageDecision decision)
     Clear_Size_LEDs();
     Set_Size_LED_Output(size, 1);
 
+    /* Reject uses PB8 while the two-blink reject indication is active. */
+    if (decision == DECISION_REJECT) {
+        Reject_LED_On();
+    }
+
     /* Accept: 1 flash (200 ms ON, then OFF).
        Reject: 2 blinks (200 ms ON/OFF, 200 ms ON/OFF). */
     led_pattern_deadline = msTicks + 200;
@@ -638,6 +764,7 @@ static void Update_Size_Result_LED(void)
 
     if (led_pattern == LED_PATTERN_ACCEPT) {
         Set_Size_LED_Output(led_pattern_size, 0);
+        Reject_LED_Off();
         led_pattern = LED_PATTERN_NONE;
         return;
     }
@@ -655,6 +782,7 @@ static void Update_Size_Result_LED(void)
     }
     else {
         Set_Size_LED_Output(led_pattern_size, 0);
+        Reject_LED_Off();
         led_pattern = LED_PATTERN_NONE;
     }
 }
@@ -717,9 +845,12 @@ void System_Init(void)
                      (1 << (LED_YELLOW_PIN * 2)));
 
     GPIOB->MODER &= ~((3 << (LED_GREEN_PIN * 2)) |
-                       (3 << (LED_REJECT_PIN * 2)));
+                       (3 << (LED_REJECT_PIN * 2)) |
+                       (3 << (LED_WAIT_LDR_PIN * 2)));
     GPIOB->MODER |= ((1 << (LED_GREEN_PIN * 2)) |
-                     (1 << (LED_REJECT_PIN * 2)));
+                     (1 << (LED_REJECT_PIN * 2)) |
+                     (1 << (LED_WAIT_LDR_PIN * 2)));
+    GPIOB->OTYPER &= ~((1 << LED_REJECT_PIN) | (1 << LED_WAIT_LDR_PIN));
     Clear_All_LEDs();
 
     /* Analog inputs */
@@ -737,15 +868,28 @@ void System_Init(void)
                     (1 << GPIO_PUPDR_PUPD4_Pos) |
                     (1 << GPIO_PUPDR_PUPD5_Pos);
 
-    /* Manual test input on PA10; later replace with IR OUT */
-    GPIOA->MODER &= ~(3 << (MANUAL_IR_TEST_PIN * 2));
-    GPIOA->PUPDR &= ~(3 << (MANUAL_IR_TEST_PIN * 2));
-    GPIOA->PUPDR |= (1 << (MANUAL_IR_TEST_PIN * 2));
+    /* External Emergency button module on PA10; use TIM1_CH3 input-capture interrupt. */
+    GPIOA->MODER &= ~(3 << (EMERGENCY_BUTTON_PIN * 2));
+    GPIOA->MODER |=  (2 << (EMERGENCY_BUTTON_PIN * 2));
+    GPIOA->PUPDR &= ~(3 << (EMERGENCY_BUTTON_PIN * 2));
+    GPIOA->PUPDR |=  (1 << (EMERGENCY_BUTTON_PIN * 2));
+    GPIOA->AFR[1] &= ~(0xF << ((EMERGENCY_BUTTON_PIN - 8) * 4));
+    GPIOA->AFR[1] |=  (1 << ((EMERGENCY_BUTTON_PIN - 8) * 4)); // AF1 = TIM1_CH3
 
-    /* External Emergency button module on PC12; wire VCC -> 3.3V, OUT -> PC12, GND -> GND. */
-    GPIOC->MODER &= ~(3 << (EMERGENCY_BUTTON_PIN * 2));
-    GPIOC->PUPDR &= ~(3 << (EMERGENCY_BUTTON_PIN * 2));
-    GPIOC->PUPDR |= (1 << (EMERGENCY_BUTTON_PIN * 2));
+    TIM1->PSC = 16000 - 1;       // 1 ms timer tick at 16 MHz
+    TIM1->CCMR2 &= ~TIM_CCMR2_CC3S;
+    TIM1->CCMR2 |= TIM_CCMR2_CC3S_0; // CC3 as input, TI3 mapped
+    TIM1->CCER &= ~(TIM_CCER_CC3P | TIM_CCER_CC3NP);
+    TIM1->CCER |= TIM_CCER_CC3P | TIM_CCER_CC3E; // falling edge
+    TIM1->DIER |= TIM_DIER_CC3IE;
+    TIM1->SR &= ~TIM_SR_CC3IF;
+    TIM1->CR1 |= TIM_CR1_CEN;
+    NVIC_EnableIRQ(TIM1_CC_IRQn);
+
+    /* Real IR input on PC10; use EXTI10 interrupt (same method as friend version). */
+    GPIOC->MODER &= ~(3 << (IR_PIN * 2));
+    GPIOC->PUPDR &= ~(3 << (IR_PIN * 2));
+    GPIOC->PUPDR |=  (1 << (IR_PIN * 2));
 
     /* EXTI3 -> PB3 */
     SYSCFG->EXTICR[0] &= ~(0xF << 12);
@@ -755,31 +899,25 @@ void System_Init(void)
     SYSCFG->EXTICR[1] &= ~((0xF << 0) | (0xF << 4));
     SYSCFG->EXTICR[1] |=  ((0x1 << 0) | (0x1 << 4));
 
-    /* EXTI10 -> PA10 */
+    /* EXTI10 -> PC10 (IR). PA10 uses TIM1_CH3 separately. */
     SYSCFG->EXTICR[2] &= ~(0xF << 8);
-    SYSCFG->EXTICR[2] |=  (0x0 << 8);
-
-    /* EXTI12 -> PC12 */
-    SYSCFG->EXTICR[3] &= ~(0xF << 0);
-    SYSCFG->EXTICR[3] |=  (0x2 << 0);
+    SYSCFG->EXTICR[2] |=  (0x2 << 8); // Port C
 
     EXTI->IMR |= (EXTI_IMR_MR3 |
                   EXTI_IMR_MR4 |
                   EXTI_IMR_MR5 |
-                  EXTI_IMR_MR10 |
-                  EXTI_IMR_MR12);
+                  EXTI_IMR_MR10);
 
     EXTI->FTSR |= (EXTI_FTSR_TR3 |
                    EXTI_FTSR_TR4 |
                    EXTI_FTSR_TR5 |
-                   EXTI_FTSR_TR10 |
-                   EXTI_FTSR_TR12);
+                   EXTI_FTSR_TR10);
 
-    EXTI->RTSR &= ~(EXTI_RTSR_TR10 | EXTI_RTSR_TR12);
+    /* Only falling edge is used for IR (active-low sensor) and all buttons. */
+    EXTI->RTSR &= ~EXTI_RTSR_TR10;
 
     /* Clear any stale pending flags before enabling the IRQs. */
-    EXTI->PR |= (EXTI_PR_PR3 | EXTI_PR_PR4 | EXTI_PR_PR5 |
-                 EXTI_PR_PR10 | EXTI_PR_PR12);
+    EXTI->PR |= (EXTI_PR_PR3 | EXTI_PR_PR4 | EXTI_PR_PR5 | EXTI_PR_PR10);
 
     NVIC_EnableIRQ(EXTI3_IRQn);
     NVIC_EnableIRQ(EXTI4_IRQn);
@@ -827,6 +965,7 @@ void System_Init(void)
                    (7 << (POT_PIN * 3));
     ADC1->CR2 |= ADC_CR2_ADON;
     ADC1->CR2 |= ADC_CR2_SWSTART;
+
 }
 
 /*==============================================================================
@@ -929,36 +1068,40 @@ void EXTI9_5_IRQHandler(void)
             else if (current_state == STATE_PAUSED) {
                 Resume_System();
             }
+            else if (current_state == STATE_FAULT) {
+                Resume_From_Fault();
+            }
         }
         EXTI->PR |= EXTI_PR_PR5;
     }
 }
 
-/* PA10 = Manual test / future IR, PC12 = External Emergency */
+/* PA10 = External Emergency via TIM1_CH3 input-capture interrupt */
+void TIM1_CC_IRQHandler(void)
+{
+    if (TIM1->SR & TIM_SR_CC3IF) {
+        TIM1->SR &= ~TIM_SR_CC3IF;
+
+        if ((msTicks - last_btn_emergency) >= BUTTON_DEBOUNCE_MS) {
+            last_btn_emergency = msTicks;
+            /* One interrupt corresponds to the falling edge of the Emergency button. */
+            Enter_Emergency();
+        }
+    }
+}
+
+/* PC10 = IR Sensor via EXTI10 interrupt */
 void EXTI15_10_IRQHandler(void)
 {
-    if (EXTI->PR & EXTI_PR_PR12) {
-        /* Emergency has priority. Stay here until RESET is pressed. */
-        EXTI->PR |= EXTI_PR_PR12;
-        Servo_SimNormal();
-        led_pattern = LED_PATTERN_NONE;
-        reset_flash_active = 0;
-        Set_Emergency_LEDs();
-        current_state = STATE_EMERGENCY;
-        UART2_TxString("\r\n[EMERGENCY] System stopped. Press RESET after fixing the problem.\r\n");
-    }
-
     if (EXTI->PR & EXTI_PR_PR10) {
+        EXTI->PR |= EXTI_PR_PR10;
+
         if ((msTicks - last_manual_trigger) >= IR_COOLDOWN_MS) {
             last_manual_trigger = msTicks;
 
-            if (current_state == STATE_RUNNING) {
-                package_active = 1;
-                wait_ldr_start_time = msTicks;
-                current_state = STATE_WAIT_LDR;
-                UART2_TxString("-> [MANUAL/IR] Package input detected. Waiting for LDR confirmation...\r\n");
+            if (current_state == STATE_RUNNING && !package_active) {
+                ir_event_pending = 1;
             }
         }
-        EXTI->PR |= EXTI_PR_PR10;
     }
 }
