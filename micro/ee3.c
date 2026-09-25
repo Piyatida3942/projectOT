@@ -61,13 +61,13 @@
 
 /* --- Timing --- */
 #define BUTTON_DEBOUNCE_MS    300
-#define IR_COOLDOWN_MS        1200
+#define IR_COOLDOWN_MS        500
 #define LDR_TIMEOUT_MS        5000      // after IR, wait up to 5 s for LDR
 #define LDR_CLEAR_TIMEOUT_MS  3000
 #define SETTLE_TIME_MS        300
 #define ROUTE_TIME_MS         1000
-#define PAUSE_TIMEOUT_MS      15000      // manual pause timeout = 15 s
-#define FAULT_TIMEOUT_MS      15000      // fault timeout = 15 s
+#define PAUSE_TIMEOUT_MS      10000      // manual pause timeout = 15 s
+#define FAULT_TIMEOUT_MS      10000      // fault timeout = 15 s
 #define LED_HOLD_TIME_MS      500
 
 /* --- UART TX ring buffer --- */
@@ -834,7 +834,7 @@ void System_Init(void)
                      RCC_AHB1ENR_GPIOCEN |
                      RCC_AHB1ENR_DMA2EN);
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
-    RCC->APB2ENR |= (RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADC1EN);
+    RCC->APB2ENR |= (RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADC1EN | RCC_APB2ENR_TIM1EN);
 
     /* LEDs */
     GPIOA->MODER &= ~((3 << (LED_STATUS_PIN * 2)) |
