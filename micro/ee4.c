@@ -1,27 +1,7 @@
 /*******************************************************************************
- * File Name    : main2_manual_test.c
+ * File Name    : main.c
  * Description  : Conveyor Simulation - Merged IR/Fault/Emergency System
  * Board        : NUCLEO-F411RE / Training Shield 1 Rev 02.00
- *
- * Current hardware:
- *   PC10 = IR input (EXTI10)
- *   PA10 = External Emergency Stop button module (TIM1_CH3 interrupt)
- *   LDR  = PA1 / ADC channel 1
- *   Pot  = PA4 / ADC channel 4
- *   Servo is NOT connected yet. Reject action is simulated by LED_REJECT_PIN.
- *
- * Current behavior:
- *   FAULT acts like an automatic pause: PAUSE resumes, RESET reports then IDLE;
- *   if FAULT lasts too long, system goes to REPORT automatically.
- *   Emergency is triggered by the external Emergency button on PA10.
- *
- * IR/LDR detection:
- *   IR uses the same EXTI/falling-edge detection logic as the latest friend version.
- *   LDR uses the same threshold logic (ADC > 2000 = detected/dark).
- *   PA10 uses TIM1_CH3 input-capture interrupt so PC10 can keep EXTI10.
- *   External Emergency button module: VCC=3.3V, OUT=PA10, GND=GND.
- *   Replace Servo_SimReject() with real Servo PWM control.
- *   Timing: IR->LDR wait = 5 s; manual PAUSE/Fault timeout = 15 s.
  *******************************************************************************/
 
 #include <stdint.h>
@@ -30,6 +10,9 @@
 #include <stdlib.h>
 #define STM32F411xE
 #include "stm32f4xx.h"
+
+/* --- Active Low/High Configuration for Reject LED --- */
+#define REJECT_LED_ACTIVE_LOW 0 // 0 = Active High (3.3V), 1 = Active Low (GND)
 
 /* --- Analog inputs --- */
 #define LIGHT_SENSOR_PIN 1      // PA1
@@ -40,8 +23,11 @@
 #define LED_RED_PIN      6      // PA6 : S
 #define LED_YELLOW_PIN   7      // PA7 : M
 #define LED_GREEN_PIN    6      // PB6 : L
-#define LED_REJECT_PIN   8      // PB8 : reject / servo simulation
-#define LED_WAIT_LDR_PIN 9      // PB9 : ON while IR detected and waiting for LDR
+#define LED_REJECT_PIN   10     // PB10: reject (ยกเว้นไม่ให้ติดตอน Reset/Emergency)
+#define LED_WAIT_LDR_PIN 9      // PB9 : wait LDR (ยกเว้นไม่ให้ติดตอน Reset/Emergency)
+
+/* --- Servo --- */
+#define SERVO_PIN        8      // PB8 : Servo motor (TIM4_CH3)
 
 /* --- Manual test input / future IR input --- */
 #define IR_PIN               10  // PC10: IR sensor output (EXTI10)
@@ -62,18 +48,18 @@
 /* --- Timing --- */
 #define BUTTON_DEBOUNCE_MS    300
 #define IR_COOLDOWN_MS        500
-#define LDR_TIMEOUT_MS        5000      // after IR, wait up to 5 s for LDR
-#define LDR_CLEAR_TIMEOUT_MS  3000
+#define LDR_TIMEOUT_MS        5000      // รอ LDR ตรวจพบวัตถุสูงสุด 5 วินาที
+#define LDR_CLEAR_TIMEOUT_MS  3000      // รอวัตถุออกจาก LDR สูงสุด 3 วินาที
 #define SETTLE_TIME_MS        300
 #define ROUTE_TIME_MS         1000
-#define PAUSE_TIMEOUT_MS      10000      // manual pause timeout = 15 s
-#define FAULT_TIMEOUT_MS      10000      // fault timeout = 15 s
+#define PAUSE_TIMEOUT_MS      10000     // Pause ค้างไว้เกิน 10s จะตัดเข้า Report
+#define FAULT_TIMEOUT_MS      10000     // Fault ค้างไว้เกิน 10s จะตัดเข้า Report
 #define LED_HOLD_TIME_MS      500
 
 /* --- UART TX ring buffer --- */
 #define TX_BUFFER_SIZE 512
 
-/* --- FSM --- */
+/* --- FSM States --- */
 typedef enum {
     STATE_IDLE,
     STATE_READY,
@@ -91,7 +77,7 @@ typedef enum {
     STATE_REPORT
 } SystemState;
 
-/* --- Package information --- */
+/* --- Package Info --- */
 typedef enum {
     SIZE_S,
     SIZE_M,
@@ -103,7 +89,7 @@ typedef enum {
     DECISION_REJECT
 } PackageDecision;
 
-/* --- Global variables --- */
+/* --- Global Variables --- */
 volatile SystemState current_state = STATE_IDLE;
 volatile SystemState resume_state = STATE_RUNNING;
 volatile PackageSize current_size = SIZE_S;
@@ -117,8 +103,8 @@ volatile uint32_t target_time = 0;
 
 volatile uint16_t count_S = 0, count_M = 0, count_L = 0;
 volatile uint16_t reject_S = 0, reject_M = 0, reject_L = 0;
-volatile uint16_t err_ir_fault = 0;   /* IR saw object, but LDR did not confirm */
-volatile uint16_t err_ldr_fault = 0;  /* LDR saw object without previous IR */
+volatile uint16_t err_ir_fault = 0;
+volatile uint16_t err_ldr_fault = 0;
 volatile uint16_t err_stuck = 0;
 volatile uint8_t last_fault_reason = 0;
 
@@ -139,10 +125,7 @@ volatile uint32_t last_btn_emergency = 0;
 volatile uint32_t last_manual_trigger = 0;
 volatile uint8_t ir_event_pending = 0;
 
-volatile uint32_t size_led_off_time = 0;
-volatile uint8_t size_led_active = 0;
-
-/* Non-blocking S/M/L result LED pattern */
+/* LED Control Patterns */
 typedef enum {
     LED_PATTERN_NONE,
     LED_PATTERN_ACCEPT,
@@ -154,7 +137,6 @@ volatile PackageSize led_pattern_size = SIZE_S;
 volatile uint8_t led_pattern_phase = 0;
 volatile uint32_t led_pattern_deadline = 0;
 
-/* Reset indication: all LEDs ON briefly, then OFF */
 volatile uint8_t reset_flash_active = 0;
 volatile uint32_t reset_flash_end_time = 0;
 volatile uint8_t report_printed = 0;
@@ -170,7 +152,7 @@ volatile uint16_t tx_tail = 0;
 
 char stringOut[300];
 
-/* --- Prototypes --- */
+/* --- Function Prototypes --- */
 void System_Init(void);
 static void UART2_TxString(const char strOut[]);
 static void Process_Evaluate(uint16_t pot_val);
@@ -192,9 +174,9 @@ static uint8_t Targets_Complete(void);
 static void Enter_Fault(uint8_t reason);
 static void Resume_From_Fault(void);
 static void Enter_Emergency(void);
-static void Servo_SimAccept(void);
-static void Servo_SimReject(void);
-static void Servo_SimNormal(void);
+static void Servo_Accept(void);
+static void Servo_Reject(void);
+static void Servo_Normal(void);
 static void Pause_System(void);
 static void Resume_System(void);
 static void Reset_To_Idle(void);
@@ -202,19 +184,21 @@ static void Process_IR_Event(void);
 static PackageSize Get_Pot_Size(uint16_t pot_val);
 
 /*==============================================================================
- * Main
+ * Main Application
  *============================================================================*/
 int main(void)
 {
     System_Init();
 
-    UART2_TxString("\r\n=== Conveyor Simulation ===\r\n");
-    UART2_TxString("IR = PC10. External Emergency button = OUT -> PA10.\r\n");
-    UART2_TxString("Waiting for PC config...\r\n");
+    /* --- [SERIAL TERMINAL MESSAGES] --- */
+    UART2_TxString("\r\n========================================\r\n");
+    UART2_TxString("   CONVEYOR SORTING SYSTEM READY\r\n");
+    UART2_TxString("========================================\r\n");
+    UART2_TxString("[SYS] Waiting for Configuration from PC...\r\n");
 
     while (1)
     {
-        /* Reset indication: all LEDs ON briefly, then OFF. */
+        /* Reset LED Flash Sequence */
         if (reset_flash_active) {
             Set_All_LEDs();
             if (msTicks >= reset_flash_end_time) {
@@ -223,28 +207,25 @@ int main(void)
             }
         }
 
-        /* Result LEDs are independent from the status LED. */
+        /* Update Size/Reject Result LEDs */
         Update_Size_Result_LED();
 
-        /* Main consumes the IR event raised by the PC10 EXTI interrupt. */
+        /* Process IR Sensor Trigger */
         if (ir_event_pending) {
             ir_event_pending = 0;
             Process_IR_Event();
         }
 
-            /* Status LED */
+        /* Status LED Behavior */
         if (!reset_flash_active) {
             if (current_state == STATE_EMERGENCY) {
-                /* Emergency: every LED stays ON while in EMERGENCY. */
-                Set_All_LEDs();
+                Set_Emergency_LEDs();
             }
             else if (current_state == STATE_WAIT_LDR) {
-                /* IR detected: PA5 remains ON and PB9 indicates waiting for LDR. */
                 GPIOA->BSRR = (1 << LED_STATUS_PIN);
                 Wait_LDR_LED_On();
             }
             else {
-                /* PB9 is only for the IR -> LDR waiting state. */
                 Wait_LDR_LED_Off();
 
                 if (current_state == STATE_RUNNING ||
@@ -253,11 +234,9 @@ int main(void)
                     current_state == STATE_ROUTE_ACCEPT ||
                     current_state == STATE_ROUTE_REJECT ||
                     current_state == STATE_WAIT_LDR_CLEAR) {
-                    /* Running: PA5 stays ON. */
                     GPIOA->BSRR = (1 << LED_STATUS_PIN);
                 }
                 else if (current_state == STATE_PAUSED || current_state == STATE_FAULT) {
-                    /* Pause/Fault: PA5 blinks. */
                     if ((msTicks / 250) % 2)
                         GPIOA->BSRR = (1 << LED_STATUS_PIN);
                     else
@@ -269,6 +248,7 @@ int main(void)
             }
         }
 
+        /* FSM Engine */
         switch (current_state)
         {
             case STATE_IDLE:
@@ -279,7 +259,8 @@ int main(void)
                     current_state = STATE_READY;
 
                     sprintf(stringOut,
-                            "Config Loaded -> S:%d, M:%d, L:%d, Time:%lus\r\nPress START (PB4)...\r\n",
+                            "[CONFIG] Loaded -> S:%d | M:%d | L:%d | Max Time:%lus\r\n"
+                            "[SYS] Press START button (PB4) to begin...\r\n",
                             target_S, target_M, target_L, target_time);
                     UART2_TxString(stringOut);
                 }
@@ -290,23 +271,17 @@ int main(void)
 
             case STATE_RUNNING:
                 if (target_time > 0 && elapsed_time >= target_time) {
-                    UART2_TxString("\r\n[TIME EXPIRED]\r\n");
+                    UART2_TxString("\r\n[TIME] Operating time expired!\r\n");
                     current_state = STATE_REPORT;
                     break;
                 }
 
                 if (target_time > 0 && elapsed_time != last_printed_sec) {
                     last_printed_sec = elapsed_time;
-                    sprintf(stringOut,
-                            "[TIME REMAINING: %lu s]\r\n",
-                            target_time - elapsed_time);
+                    sprintf(stringOut, "[TIME] Remaining: %lu s\r\n", target_time - elapsed_time);
                     UART2_TxString(stringOut);
                 }
 
-                /*
-                 * No package should reach LDR before the manual/IR input.
-                 * This is the "LDR detected without previous IR" fault.
-                 */
                 if (!package_active && IS_LDR_DARK()) {
                     Enter_Fault(2);
                 }
@@ -316,7 +291,7 @@ int main(void)
                 if (IS_LDR_DARK()) {
                     settle_start_time = msTicks;
                     current_state = STATE_SETTLE;
-                    UART2_TxString("-> [LDR] Package confirmed at sorting point.\r\n");
+                    UART2_TxString("[SENSOR] LDR -> Package arrived at sorting point.\r\n");
                 }
                 else if ((msTicks - wait_ldr_start_time) >= LDR_TIMEOUT_MS) {
                     Enter_Fault(1);
@@ -336,25 +311,19 @@ int main(void)
 
                 if (current_decision == DECISION_ACCEPT) {
                     Start_Size_Result_LED(current_size, DECISION_ACCEPT);
-                    Servo_SimAccept();
+                    Servo_Accept();
                     current_state = STATE_ROUTE_ACCEPT;
-                    UART2_TxString("-> [ACCEPT] Package is moving to its size conveyor.\r\n");
+                    UART2_TxString("[EVAL] Decision: ACCEPT -> Routing to target tray.\r\n");
                 }
                 else {
                     Start_Size_Result_LED(current_size, DECISION_REJECT);
-                    Servo_SimReject();
+                    Servo_Reject();
                     current_state = STATE_ROUTE_REJECT;
-                    UART2_TxString("-> [REJECT] Servo action simulated; size LED blinks twice.\r\n");
+                    UART2_TxString("[EVAL] Decision: REJECT -> Actuating Servo to discard.\r\n");
                 }
                 break;
 
             case STATE_ROUTE_ACCEPT:
-                if ((msTicks - route_start_time) >= ROUTE_TIME_MS) {
-                    ldr_clear_start_time = msTicks;
-                    current_state = STATE_WAIT_LDR_CLEAR;
-                }
-                break;
-
             case STATE_ROUTE_REJECT:
                 if ((msTicks - route_start_time) >= ROUTE_TIME_MS) {
                     ldr_clear_start_time = msTicks;
@@ -376,7 +345,7 @@ int main(void)
                     }
 
                     package_active = 0;
-                    Servo_SimNormal();
+                    Servo_Normal();
                     Clear_All_LEDs();
 
                     if (current_decision == DECISION_ACCEPT && Targets_Complete()) {
@@ -394,41 +363,39 @@ int main(void)
 
             case STATE_PAUSED:
                 if ((msTicks - pause_start_time) >= PAUSE_TIMEOUT_MS) {
-                    UART2_TxString("\r\n[PAUSE TIMEOUT] Going to report before reset.\r\n");
+                    UART2_TxString("\r\n[SYS] Pause timeout reached! Generating report...\r\n");
                     Start_Reset_Flash();
                     current_state = STATE_REPORT;
                 }
                 break;
 
             case STATE_FAULT:
-                /* FAULT behaves like an automatic pause.
-                 * Resume with PAUSE button, or let the timeout go to REPORT.
-                 */
                 if ((msTicks - fault_start_time) >= FAULT_TIMEOUT_MS) {
-                    UART2_TxString("\r\n[FAULT TIMEOUT] Fault lasted too long. Going to report before reset.\r\n");
+                    UART2_TxString("\r\n[SYS] Fault timeout reached! Generating report...\r\n");
                     Start_Reset_Flash();
                     current_state = STATE_REPORT;
                 }
                 break;
 
             case STATE_EMERGENCY:
-                /* Emergency stays stopped until RESET is pressed. */
                 break;
 
             case STATE_COMPLETE:
-                UART2_TxString("\r\n[TARGET COMPLETE]\r\n");
+                UART2_TxString("\r\n[SYS] All target package counts reached successfully!\r\n");
                 current_state = STATE_REPORT;
                 break;
 
             case STATE_REPORT:
                 if (!report_printed) {
                     sprintf(stringOut,
-                            "\r\n=== TEST REPORT ===\r\n"
-                            "ACCEPTED -> S:%d/%d, M:%d/%d, L:%d/%d\r\n"
-                            "REJECTED -> S:%d, M:%d, L:%d\r\n"
-                            "ERRORS   -> IR Fault:%d, LDR Fault:%d, Stuck:%d\r\n"
+                            "\r\n========================================\r\n"
+                            "            SUMMARY REPORT              \r\n"
+                            "========================================\r\n"
+                            "ACCEPTED -> S: %d/%d | M: %d/%d | L: %d/%d\r\n"
+                            "REJECTED -> S: %d    | M: %d    | L: %d\r\n"
+                            "ERRORS   -> IR Loss: %d | Unregistered LDR: %d | Stuck: %d\r\n"
                             "ELAPSED TIME -> %lu s\r\n"
-                            "===================\r\n",
+                            "========================================\r\n",
                             count_S, target_S, count_M, target_M, count_L, target_L,
                             reject_S, reject_M, reject_L,
                             err_ir_fault, err_ldr_fault, err_stuck,
@@ -437,7 +404,6 @@ int main(void)
                     report_printed = 1;
                 }
 
-                /* Keep the reset flash visible briefly before clearing the run. */
                 if (!reset_flash_active) {
                     Reset_To_Idle();
                 }
@@ -447,7 +413,7 @@ int main(void)
 }
 
 /*==============================================================================
- * IR / Pot helpers
+ * IR / Pot Helpers
  *============================================================================*/
 static void Process_IR_Event(void)
 {
@@ -456,7 +422,7 @@ static void Process_IR_Event(void)
     package_active = 1;
     wait_ldr_start_time = msTicks;
     current_state = STATE_WAIT_LDR;
-    UART2_TxString("-> [IR] Package input detected at PC10. Waiting for LDR confirmation...\r\n");
+    UART2_TxString("[SENSOR] IR -> Entry detected. Waiting for LDR sensor...\r\n");
 }
 
 static PackageSize Get_Pot_Size(uint16_t pot_val)
@@ -466,54 +432,44 @@ static PackageSize Get_Pot_Size(uint16_t pot_val)
     return SIZE_L;
 }
 
-/*==============================================================================
- * Package evaluation
- *============================================================================*/
 static void Process_Evaluate(uint16_t pot_val)
 {
     current_size = Get_Pot_Size(pot_val);
 
     if (current_size == SIZE_S) {
         current_decision = (count_S < target_S) ? DECISION_ACCEPT : DECISION_REJECT;
+        UART2_TxString("[EVAL] Size Measured: [ SMALL ]\r\n");
     }
     else if (current_size == SIZE_M) {
         current_decision = (count_M < target_M) ? DECISION_ACCEPT : DECISION_REJECT;
+        UART2_TxString("[EVAL] Size Measured: [ MEDIUM ]\r\n");
     }
     else {
         current_decision = (count_L < target_L) ? DECISION_ACCEPT : DECISION_REJECT;
-    }
-
-    if (current_size == SIZE_S) {
-        UART2_TxString("-> Size S detected.\r\n");
-    }
-    else if (current_size == SIZE_M) {
-        UART2_TxString("-> Size M detected.\r\n");
-    }
-    else {
-        UART2_TxString("-> Size L detected.\r\n");
+        UART2_TxString("[EVAL] Size Measured: [ LARGE ]\r\n");
     }
 }
 
 /*==============================================================================
- * Servo placeholder
+ * Servo Control
  *============================================================================*/
-static void Servo_SimAccept(void)
+static void Servo_Accept(void)
 {
-    /* No real servo yet. Accept = servo stays in normal position. */
+    TIM4->CCR3 = 150; // Position Center (90 deg)
 }
 
-static void Servo_SimReject(void)
+static void Servo_Reject(void)
 {
-    /* No real servo yet. The S/M/L LED pattern represents the reject action. */
+    TIM4->CCR3 = 110; // Position Discard (~50 deg)
 }
 
-static void Servo_SimNormal(void)
+static void Servo_Normal(void)
 {
-    /* Future real servo will return to its normal position here. */
+    TIM4->CCR3 = 150; // Reset Position
 }
 
 /*==============================================================================
- * State / utility helpers
+ * State & LED Helper Functions
  *============================================================================*/
 static uint8_t Targets_Complete(void)
 {
@@ -529,22 +485,22 @@ static void Enter_Fault(uint8_t reason)
     fault_start_time = msTicks;
     resume_state = STATE_RUNNING;
 
-    Servo_SimNormal();
+    Servo_Normal();
     Clear_All_LEDs();
 
     if (reason == 1) {
         err_ir_fault++;
-        UART2_TxString("\r\n[FAULT][IR] Object detected by IR, but LDR did not confirm within timeout.\r\n");
+        UART2_TxString("\r\n[FAULT] IR triggered, but package missed LDR sensor!\r\n");
     }
     else if (reason == 2) {
         err_ldr_fault++;
-        UART2_TxString("\r\n[FAULT][LDR] LDR detected an object without a preceding IR detection.\r\n");
+        UART2_TxString("\r\n[FAULT] Unregistered entry at LDR sensor without IR trigger!\r\n");
     }
     else {
-        UART2_TxString("\r\n[FAULT] OBJECT STUCK: package did not leave LDR point.\r\n");
+        UART2_TxString("\r\n[FAULT] Package STUCK at sorting zone!\r\n");
     }
 
-    UART2_TxString("[FAULT] System paused automatically. Press PAUSE to resume or RESET for report.\r\n");
+    UART2_TxString("[SYS] System paused. Press PAUSE (PB5) to resume or RESET (PB3).\r\n");
     current_state = STATE_FAULT;
 }
 
@@ -553,18 +509,19 @@ static void Resume_From_Fault(void)
     fault_start_time = 0;
     last_printed_sec = 0xFFFFFFFF;
     current_state = STATE_RUNNING;
-    UART2_TxString("\r\n[FAULT RESUMED] System back to RUNNING. Waiting for next package...\r\n");
+    UART2_TxString("\r\n[SYS] Resuming from fault. Conveyor active...\r\n");
 }
 
 static void Enter_Emergency(void)
 {
     package_active = 0;
-    Servo_SimNormal();
+    Servo_Normal();
     led_pattern = LED_PATTERN_NONE;
     reset_flash_active = 0;
-    Set_All_LEDs();
+    
+    Set_Emergency_LEDs();
     current_state = STATE_EMERGENCY;
-    UART2_TxString("\r\n[EMERGENCY] Emergency button pressed. System stopped. Press RESET after fixing the problem.\r\n");
+    UART2_TxString("\r\n[EMERGENCY] STOP BUTTON PRESSED! All operations halted.\r\n");
 }
 
 static void Pause_System(void)
@@ -572,33 +529,23 @@ static void Pause_System(void)
     resume_state = current_state;
     pause_start_time = msTicks;
     current_state = STATE_PAUSED;
-    UART2_TxString("\r\n[PAUSED]\r\n");
+    UART2_TxString("\r\n[SYS] System PAUSED.\r\n");
 }
 
 static void Resume_System(void)
 {
     uint32_t paused_ms = msTicks - pause_start_time;
 
-    if (resume_state == STATE_WAIT_LDR) {
-        wait_ldr_start_time += paused_ms;
-    }
-    else if (resume_state == STATE_SETTLE) {
-        settle_start_time += paused_ms;
-    }
-    else if (resume_state == STATE_ROUTE_ACCEPT || resume_state == STATE_ROUTE_REJECT) {
-        route_start_time += paused_ms;
-    }
-    else if (resume_state == STATE_WAIT_LDR_CLEAR) {
-        ldr_clear_start_time += paused_ms;
-    }
+    if (resume_state == STATE_WAIT_LDR) wait_ldr_start_time += paused_ms;
+    else if (resume_state == STATE_SETTLE) settle_start_time += paused_ms;
+    else if (resume_state == STATE_ROUTE_ACCEPT || resume_state == STATE_ROUTE_REJECT) route_start_time += paused_ms;
+    else if (resume_state == STATE_WAIT_LDR_CLEAR) ldr_clear_start_time += paused_ms;
 
-    if (led_pattern != LED_PATTERN_NONE) {
-        led_pattern_deadline += paused_ms;
-    }
+    if (led_pattern != LED_PATTERN_NONE) led_pattern_deadline += paused_ms;
 
     last_printed_sec = 0xFFFFFFFF;
     current_state = resume_state;
-    UART2_TxString("\r\n[RESUMED]\r\n");
+    UART2_TxString("\r\n[SYS] System RESUMED.\r\n");
 }
 
 static void Start_Reset_Flash(void)
@@ -610,28 +557,27 @@ static void Start_Reset_Flash(void)
 
 static void Request_Reset_Report(void)
 {
-    /* During an active run/fault/emergency, show the current report first. */
     if (current_state == STATE_IDLE || current_state == STATE_READY) {
         Reset_To_Idle();
         return;
     }
 
-    Servo_SimNormal();
+    Servo_Normal();
     Start_Reset_Flash();
     current_state = STATE_REPORT;
-    UART2_TxString("\r\n[RESET] Current run will be reported, then system returns to IDLE.\r\n");
+    UART2_TxString("\r\n[SYS] RESET pressed. Finalizing report...\r\n");
 }
 
 static void Reset_To_Idle(void)
 {
-    Servo_SimNormal();
+    Servo_Normal();
     reset_flash_active = 0;
     Clear_All_LEDs();
     Reset_Metrics();
     target_S = target_M = target_L = 0;
     target_time = 0;
     current_state = STATE_IDLE;
-    UART2_TxString("\r\n[RESET] System -> IDLE\r\nWaiting for new config...\r\n");
+    UART2_TxString("\r\n[SYS] System Reset -> IDLE. Waiting for configuration...\r\n");
 }
 
 static void Reset_Metrics(void)
@@ -669,18 +615,30 @@ static void Clear_All_LEDs(void)
                   (1 << (LED_RED_PIN + 16)) |
                   (1 << (LED_YELLOW_PIN + 16));
     GPIOB->BSRR = (1 << (LED_GREEN_PIN + 16)) |
-                  (1 << (LED_REJECT_PIN + 16)) |
                   (1 << (LED_WAIT_LDR_PIN + 16));
+    Reject_LED_Off();
 }
 
+/* -----------------------------------------------------------------------------
+ * Set_All_LEDs: เรียกใช้ตอน Reset Flash หรือ Emergency
+ * ยกเว้น PB9 (WAIT_LDR) และ PB10 (REJECT) ไม่ให้ติดสว่างด้วย
+ * ---------------------------------------------------------------------------*/
 static void Set_All_LEDs(void)
 {
+    /* ติดสว่างเฉพาะไฟ Main Status และไฟขนาด S, M, L */
     GPIOA->BSRR = (1 << LED_STATUS_PIN) |
                   (1 << LED_RED_PIN) |
                   (1 << LED_YELLOW_PIN);
-    GPIOB->BSRR = (1 << LED_GREEN_PIN) |
-                  (1 << LED_REJECT_PIN) |
-                  (1 << LED_WAIT_LDR_PIN);
+    GPIOB->BSRR = (1 << LED_GREEN_PIN);
+
+    /* สั่งปิด PB9 และ PB10 ให้แน่ใจเสมอว่าไม่เกี่ยวข้อง */
+    GPIOB->BSRR = (1 << (LED_WAIT_LDR_PIN + 16));
+    Reject_LED_Off();
+}
+
+static void Set_Emergency_LEDs(void)
+{
+    Set_All_LEDs();
 }
 
 static void Wait_LDR_LED_On(void)
@@ -746,13 +704,10 @@ static void Start_Size_Result_LED(PackageSize size, PackageDecision decision)
     Clear_Size_LEDs();
     Set_Size_LED_Output(size, 1);
 
-    /* Reject uses PB8 while the two-blink reject indication is active. */
     if (decision == DECISION_REJECT) {
         Reject_LED_On();
     }
 
-    /* Accept: 1 flash (200 ms ON, then OFF).
-       Reject: 2 blinks (200 ms ON/OFF, 200 ms ON/OFF). */
     led_pattern_deadline = msTicks + 200;
 }
 
@@ -769,7 +724,6 @@ static void Update_Size_Result_LED(void)
         return;
     }
 
-    /* Reject pattern phases: ON -> OFF -> ON -> OFF */
     led_pattern_phase++;
 
     if (led_pattern_phase == 1) {
@@ -787,11 +741,6 @@ static void Update_Size_Result_LED(void)
     }
 }
 
-static void Set_Emergency_LEDs(void)
-{
-    Set_All_LEDs();
-}
-
 static void Parse_Config(char* str)
 {
     target_S = target_M = target_L = target_time = 0;
@@ -804,7 +753,7 @@ static void Parse_Config(char* str)
 }
 
 /*==============================================================================
- * UART TX ring buffer
+ * UART TX Ring Buffer
  *============================================================================*/
 static void UART2_TxString(const char strOut[])
 {
@@ -823,7 +772,7 @@ static void UART2_TxString(const char strOut[])
 }
 
 /*==============================================================================
- * Hardware init
+ * Hardware Initialization
  *============================================================================*/
 void System_Init(void)
 {
@@ -833,10 +782,10 @@ void System_Init(void)
                      RCC_AHB1ENR_GPIOBEN |
                      RCC_AHB1ENR_GPIOCEN |
                      RCC_AHB1ENR_DMA2EN);
-    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+    RCC->APB1ENR |= (RCC_APB1ENR_USART2EN | RCC_APB1ENR_TIM4EN);
     RCC->APB2ENR |= (RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADC1EN | RCC_APB2ENR_TIM1EN);
 
-    /* LEDs */
+    /* LEDs Config */
     GPIOA->MODER &= ~((3 << (LED_STATUS_PIN * 2)) |
                        (3 << (LED_RED_PIN * 2)) |
                        (3 << (LED_YELLOW_PIN * 2)));
@@ -853,11 +802,27 @@ void System_Init(void)
     GPIOB->OTYPER &= ~((1 << LED_REJECT_PIN) | (1 << LED_WAIT_LDR_PIN));
     Clear_All_LEDs();
 
+    /* Servo TIM4 PWM on PB8 */
+    GPIOB->MODER &= ~(3 << (SERVO_PIN * 2));
+    GPIOB->MODER |=  (2 << (SERVO_PIN * 2));
+    GPIOB->AFR[1] &= ~(0xF << ((SERVO_PIN - 8) * 4));
+    GPIOB->AFR[1] |=  (2 << ((SERVO_PIN - 8) * 4));
+
+    TIM4->PSC = 160 - 1;
+    TIM4->ARR = 2000 - 1;
+    TIM4->CCMR2 &= ~TIM_CCMR2_CC3S;
+    TIM4->CCMR2 |= TIM_CCMR2_OC3M_1 | TIM_CCMR2_OC3M_2;
+    TIM4->CCMR2 |= TIM_CCMR2_OC3PE;
+    TIM4->CCER |= TIM_CCER_CC3E;
+    TIM4->CR1 |= TIM_CR1_ARPE;
+    TIM4->CR1 |= TIM_CR1_CEN;
+    TIM4->CCR3 = 150;
+
     /* Analog inputs */
     GPIOA->MODER |= (3 << (LIGHT_SENSOR_PIN * 2)) |
                     (3 << (POT_PIN * 2));
 
-    /* Existing buttons: PB3 Reset, PB4 Start, PB5 Pause */
+    /* Buttons PB3, PB4, PB5 */
     GPIOB->MODER &= ~(GPIO_MODER_MODER3 |
                       GPIO_MODER_MODER4 |
                       GPIO_MODER_MODER5);
@@ -868,55 +833,37 @@ void System_Init(void)
                     (1 << GPIO_PUPDR_PUPD4_Pos) |
                     (1 << GPIO_PUPDR_PUPD5_Pos);
 
-    /* External Emergency button module on PA10; use TIM1_CH3 input-capture interrupt. */
+    /* Emergency PA10 */
     GPIOA->MODER &= ~(3 << (EMERGENCY_BUTTON_PIN * 2));
     GPIOA->MODER |=  (2 << (EMERGENCY_BUTTON_PIN * 2));
     GPIOA->PUPDR &= ~(3 << (EMERGENCY_BUTTON_PIN * 2));
     GPIOA->PUPDR |=  (1 << (EMERGENCY_BUTTON_PIN * 2));
     GPIOA->AFR[1] &= ~(0xF << ((EMERGENCY_BUTTON_PIN - 8) * 4));
-    GPIOA->AFR[1] |=  (1 << ((EMERGENCY_BUTTON_PIN - 8) * 4)); // AF1 = TIM1_CH3
+    GPIOA->AFR[1] |=  (1 << ((EMERGENCY_BUTTON_PIN - 8) * 4));
 
-    TIM1->PSC = 16000 - 1;       // 1 ms timer tick at 16 MHz
+    TIM1->PSC = 16000 - 1;
     TIM1->CCMR2 &= ~TIM_CCMR2_CC3S;
-    TIM1->CCMR2 |= TIM_CCMR2_CC3S_0; // CC3 as input, TI3 mapped
+    TIM1->CCMR2 |= TIM_CCMR2_CC3S_0;
     TIM1->CCER &= ~(TIM_CCER_CC3P | TIM_CCER_CC3NP);
-    TIM1->CCER |= TIM_CCER_CC3P | TIM_CCER_CC3E; // falling edge
+    TIM1->CCER |= TIM_CCER_CC3P | TIM_CCER_CC3E;
     TIM1->DIER |= TIM_DIER_CC3IE;
     TIM1->SR &= ~TIM_SR_CC3IF;
     TIM1->CR1 |= TIM_CR1_CEN;
     NVIC_EnableIRQ(TIM1_CC_IRQn);
 
-    /* Real IR input on PC10; use EXTI10 interrupt (same method as friend version). */
+    /* IR PC10 */
     GPIOC->MODER &= ~(3 << (IR_PIN * 2));
     GPIOC->PUPDR &= ~(3 << (IR_PIN * 2));
     GPIOC->PUPDR |=  (1 << (IR_PIN * 2));
 
-    /* EXTI3 -> PB3 */
-    SYSCFG->EXTICR[0] &= ~(0xF << 12);
-    SYSCFG->EXTICR[0] |=  (0x1 << 12);
+    /* EXTI Interrupts Setup */
+    SYSCFG->EXTICR[0] &= ~(0xF << 12); SYSCFG->EXTICR[0] |= (0x1 << 12); // EXTI3 PB3
+    SYSCFG->EXTICR[1] &= ~((0xF << 0) | (0xF << 4)); SYSCFG->EXTICR[1] |= ((0x1 << 0) | (0x1 << 4)); // EXTI4 PB4, EXTI5 PB5
+    SYSCFG->EXTICR[2] &= ~(0xF << 8);  SYSCFG->EXTICR[2] |= (0x2 << 8);  // EXTI10 PC10
 
-    /* EXTI4 -> PB4, EXTI5 -> PB5 */
-    SYSCFG->EXTICR[1] &= ~((0xF << 0) | (0xF << 4));
-    SYSCFG->EXTICR[1] |=  ((0x1 << 0) | (0x1 << 4));
-
-    /* EXTI10 -> PC10 (IR). PA10 uses TIM1_CH3 separately. */
-    SYSCFG->EXTICR[2] &= ~(0xF << 8);
-    SYSCFG->EXTICR[2] |=  (0x2 << 8); // Port C
-
-    EXTI->IMR |= (EXTI_IMR_MR3 |
-                  EXTI_IMR_MR4 |
-                  EXTI_IMR_MR5 |
-                  EXTI_IMR_MR10);
-
-    EXTI->FTSR |= (EXTI_FTSR_TR3 |
-                   EXTI_FTSR_TR4 |
-                   EXTI_FTSR_TR5 |
-                   EXTI_FTSR_TR10);
-
-    /* Only falling edge is used for IR (active-low sensor) and all buttons. */
+    EXTI->IMR |= (EXTI_IMR_MR3 | EXTI_IMR_MR4 | EXTI_IMR_MR5 | EXTI_IMR_MR10);
+    EXTI->FTSR |= (EXTI_FTSR_TR3 | EXTI_FTSR_TR4 | EXTI_FTSR_TR5 | EXTI_FTSR_TR10);
     EXTI->RTSR &= ~EXTI_RTSR_TR10;
-
-    /* Clear any stale pending flags before enabling the IRQs. */
     EXTI->PR |= (EXTI_PR_PR3 | EXTI_PR_PR4 | EXTI_PR_PR5 | EXTI_PR_PR10);
 
     NVIC_EnableIRQ(EXTI3_IRQn);
@@ -924,52 +871,38 @@ void System_Init(void)
     NVIC_EnableIRQ(EXTI9_5_IRQn);
     NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-    /* UART2: PA2 TX, PA3 RX */
+    /* UART2 Setup */
     GPIOA->MODER &= ~(GPIO_MODER_MODER2 | GPIO_MODER_MODER3);
-    GPIOA->MODER |= ((2 << GPIO_MODER_MODER2_Pos) |
-                     (2 << GPIO_MODER_MODER3_Pos));
+    GPIOA->MODER |= ((2 << GPIO_MODER_MODER2_Pos) | (2 << GPIO_MODER_MODER3_Pos));
     GPIOA->AFR[0] &= ~(GPIO_AFRL_AFRL2 | GPIO_AFRL_AFRL3);
-    GPIOA->AFR[0] |= ((7 << GPIO_AFRL_AFSEL2_Pos) |
-                      (7 << GPIO_AFRL_AFSEL3_Pos));
+    GPIOA->AFR[0] |= ((7 << GPIO_AFRL_AFSEL2_Pos) | (7 << GPIO_AFRL_AFSEL3_Pos));
 
     USART2->BRR = 0x8B;
-    USART2->CR1 |= (USART_CR1_TE |
-                    USART_CR1_RE |
-                    USART_CR1_RXNEIE |
-                    USART_CR1_UE);
+    USART2->CR1 |= (USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE);
     NVIC_EnableIRQ(USART2_IRQn);
 
-    /* ADC1 + DMA: continuously updates LDR and Pot without polling */
+    /* ADC1 & DMA Setup */
     DMA2_Stream0->CR = 0;
     while (DMA2_Stream0->CR & DMA_SxCR_EN);
 
     DMA2_Stream0->PAR = (uint32_t)&ADC1->DR;
     DMA2_Stream0->M0AR = (uint32_t)adc_buffer;
     DMA2_Stream0->NDTR = 2;
-    DMA2_Stream0->CR |= (0 << 25) |
-                        (1 << 13) |
-                        (1 << 11) |
-                        (1 << 10) |
-                        (1 << 8);
+    DMA2_Stream0->CR |= (0 << 25) | (1 << 13) | (1 << 11) | (1 << 10) | (1 << 8);
     DMA2_Stream0->CR |= DMA_SxCR_EN;
 
     ADC1->CR2 &= ~ADC_CR2_ADON;
     ADC1->CR1 |= ADC_CR1_SCAN;
-    ADC1->CR2 |= ADC_CR2_CONT |
-                 ADC_CR2_DMA |
-                 ADC_CR2_DDS;
+    ADC1->CR2 |= ADC_CR2_CONT | ADC_CR2_DMA | ADC_CR2_DDS;
     ADC1->SQR1 |= (1 << 20);
-    ADC1->SQR3 = (LIGHT_SENSOR_PIN << 0) |
-                 (POT_PIN << 5);
-    ADC1->SMPR2 |= (7 << (LIGHT_SENSOR_PIN * 3)) |
-                   (7 << (POT_PIN * 3));
+    ADC1->SQR3 = (LIGHT_SENSOR_PIN << 0) | (POT_PIN << 5);
+    ADC1->SMPR2 |= (7 << (LIGHT_SENSOR_PIN * 3)) | (7 << (POT_PIN * 3));
     ADC1->CR2 |= ADC_CR2_ADON;
     ADC1->CR2 |= ADC_CR2_SWSTART;
-
 }
 
 /*==============================================================================
- * Interrupt handlers
+ * Interrupt Handlers
  *============================================================================*/
 void SysTick_Handler(void)
 {
@@ -1005,8 +938,7 @@ void USART2_IRQHandler(void)
         }
     }
 
-    if ((USART2->SR & USART_SR_TXE) &&
-        (USART2->CR1 & USART_CR1_TXEIE)) {
+    if ((USART2->SR & USART_SR_TXE) && (USART2->CR1 & USART_CR1_TXEIE)) {
         if (tx_head != tx_tail) {
             USART2->DR = tx_buffer[tx_tail];
             tx_tail = (uint16_t)((tx_tail + 1) % TX_BUFFER_SIZE);
@@ -1017,21 +949,19 @@ void USART2_IRQHandler(void)
     }
 }
 
-/* PB3 = Reset */
+/* PB3 = Reset Button */
 void EXTI3_IRQHandler(void)
 {
     if (EXTI->PR & EXTI_PR_PR3) {
         if ((msTicks - last_btn_reset) >= BUTTON_DEBOUNCE_MS) {
             last_btn_reset = msTicks;
-
-            /* Active states go to REPORT first; IDLE/READY reset directly. */
             Request_Reset_Report();
         }
         EXTI->PR |= EXTI_PR_PR3;
     }
 }
 
-/* PB4 = Start */
+/* PB4 = Start Button */
 void EXTI4_IRQHandler(void)
 {
     if (EXTI->PR & EXTI_PR_PR4) {
@@ -1042,14 +972,14 @@ void EXTI4_IRQHandler(void)
                 elapsed_time = 0;
                 last_printed_sec = 0xFFFFFFFF;
                 current_state = STATE_RUNNING;
-                UART2_TxString("\r\n[STARTED]\r\n");
+                UART2_TxString("\r\n[SYS] Conveyor Started!\r\n");
             }
         }
         EXTI->PR |= EXTI_PR_PR4;
     }
 }
 
-/* PB5 = Pause / Resume */
+/* PB5 = Pause / Resume Button */
 void EXTI9_5_IRQHandler(void)
 {
     if (EXTI->PR & EXTI_PR_PR5) {
@@ -1076,7 +1006,7 @@ void EXTI9_5_IRQHandler(void)
     }
 }
 
-/* PA10 = External Emergency via TIM1_CH3 input-capture interrupt */
+/* PA10 = Emergency Button Module */
 void TIM1_CC_IRQHandler(void)
 {
     if (TIM1->SR & TIM_SR_CC3IF) {
@@ -1084,13 +1014,12 @@ void TIM1_CC_IRQHandler(void)
 
         if ((msTicks - last_btn_emergency) >= BUTTON_DEBOUNCE_MS) {
             last_btn_emergency = msTicks;
-            /* One interrupt corresponds to the falling edge of the Emergency button. */
             Enter_Emergency();
         }
     }
 }
 
-/* PC10 = IR Sensor via EXTI10 interrupt */
+/* PC10 = IR Sensor */
 void EXTI15_10_IRQHandler(void)
 {
     if (EXTI->PR & EXTI_PR_PR10) {
