@@ -48,7 +48,7 @@ others(report -> back to idle)
 Paused
 LED - blue  กพ
 resumed running
-timeout (report -> back to idle)
+timeout (report -> back to idle) 
 -----------------------------
 Emergency (all led in board on ค้)
 reset only (all led in กพ)
