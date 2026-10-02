@@ -51,13 +51,13 @@
 #define LDR_TIMEOUT_MS        5000      // รอ LDR ตรวจพบวัตถุสูงสุด 5 วินาที
 #define LDR_CLEAR_TIMEOUT_MS  3000      // รอวัตถุออกจาก LDR สูงสุด 3 วินาที
 #define SETTLE_TIME_MS        300
-#define ROUTE_TIME_MS         1000
+#define ROUTE_TIME_MS         400       // เวลาให้วัตถุเคลื่อนผ่านเซอโว
 #define PAUSE_TIMEOUT_MS      10000     // Pause ค้างไว้เกิน 10s จะตัดเข้า Report
 #define FAULT_TIMEOUT_MS      10000     // Fault ค้างไว้เกิน 10s จะตัดเข้า Report
 #define LED_HOLD_TIME_MS      500
 
 /* --- UART TX ring buffer --- */
-#define TX_BUFFER_SIZE 512
+#define TX_BUFFER_SIZE 1024
 
 /* --- FSM States --- */
 typedef enum {
@@ -150,7 +150,7 @@ char tx_buffer[TX_BUFFER_SIZE];
 volatile uint16_t tx_head = 0;
 volatile uint16_t tx_tail = 0;
 
-char stringOut[300];
+char stringOut[600];
 
 /* --- Function Prototypes --- */
 void System_Init(void);
@@ -192,7 +192,7 @@ int main(void)
 
     /* --- [STARTUP TERMINAL MESSAGE] --- */
     UART2_TxString("\r\n========================================\r\n");
-    UART2_TxString("SORTING PACKAGE SYSTEM SIMULATION READY.\r\n");
+    UART2_TxString("PACKAGE SORTING SYSTEM SIMULATION READY\r\n");
     UART2_TxString("========================================\r\n");
     UART2_TxString("Waiting for Configuration from PC (Format : S2,M2,L2,T30)\r\n");
 
@@ -261,11 +261,9 @@ int main(void)
 
                     sprintf(stringOut,
                             "\r\n[CONFIG] Loaded\r\n"
-                            "      S: %d\r\n"
-                            "      M: %d\r\n"
-                            "      L: %d\r\n"
-                            "      Max Time: %lu s\r\n\r\n"
-                            "Press START button (PB4) to begin.\r\n",
+                            "S: %d | M: %d | L: %d\r\n"
+                            "Max Time: %lu s\r\n"
+                            "[SYS] Press START button (PB4) to begin\r\n",
                             target_S, target_M, target_L, target_time);
                     UART2_TxString(stringOut);
                 }
@@ -296,7 +294,7 @@ int main(void)
                 if (IS_LDR_DARK()) {
                     settle_start_time = msTicks;
                     current_state = STATE_SETTLE;
-                    UART2_TxString("[SENSOR] LDR -> Package arrived at sorting point.\r\n");
+                    UART2_TxString("[SENSOR] LDR : Package arrived at sorting point.\r\n");
                 }
                 else if ((msTicks - wait_ldr_start_time) >= LDR_TIMEOUT_MS) {
                     Enter_Fault(1);
@@ -316,15 +314,25 @@ int main(void)
 
                 if (current_decision == DECISION_ACCEPT) {
                     Start_Size_Result_LED(current_size, DECISION_ACCEPT);
-                    Servo_Accept();
+                    Servo_Normal(); // ACCEPT -> เซอโวอยู่นิ่งที่ตำแหน่งปกติ
                     current_state = STATE_ROUTE_ACCEPT;
-                    UART2_TxString("[EVAL] Decision: ACCEPT -> Routing to target tray.\r\n");
+                    UART2_TxString("[EVAL] Decision: ACCEPT -> Passing through (Servo Normal).\r\n");
+
+                    uint16_t q = (current_size == SIZE_S) ? target_S : (current_size == SIZE_M) ? target_M : target_L;
+                    uint16_t a = (current_size == SIZE_S) ? count_S : (current_size == SIZE_M) ? count_M : count_L;
+                    sprintf(stringOut, "Quota: %d | Accepted: %d\r\n", q, a);
+                    UART2_TxString(stringOut);
                 }
                 else {
                     Start_Size_Result_LED(current_size, DECISION_REJECT);
-                    Servo_Reject();
+                    Servo_Reject(); // REJECT -> สั่งเซอโวปัดชิ้นงาน
                     current_state = STATE_ROUTE_REJECT;
                     UART2_TxString("[EVAL] Decision: REJECT -> Actuating Servo to discard.\r\n");
+
+                    uint16_t q = (current_size == SIZE_S) ? target_S : (current_size == SIZE_M) ? target_M : target_L;
+                    uint16_t r = (current_size == SIZE_S) ? reject_S : (current_size == SIZE_M) ? reject_M : reject_L;
+                    sprintf(stringOut, "Quota: %d | Rejected: %d\r\n", q, r);
+                    UART2_TxString(stringOut);
                 }
                 break;
 
@@ -351,7 +359,6 @@ int main(void)
 
                     package_active = 0;
                     Servo_Normal();
-                    Clear_All_LEDs();
 
                     if (current_decision == DECISION_ACCEPT && Targets_Complete()) {
                         current_state = STATE_COMPLETE;
@@ -392,19 +399,69 @@ int main(void)
 
             case STATE_REPORT:
                 if (!report_printed) {
+                    uint32_t total_target   = target_S + target_M + target_L;
+                    uint32_t total_accepted = count_S + count_M + count_L;
+                    uint32_t total_rejected = reject_S + reject_M + reject_L;
+                    uint32_t total_errors   = err_ir_fault + err_ldr_fault + err_stuck;
+                    uint32_t total_input    = total_accepted + total_rejected + total_errors;
+
+                    uint32_t eff_whole = 0, eff_dec = 0;
+                    uint32_t loss_whole = 0, loss_dec = 0;
+                    uint32_t rej_whole = 0, rej_dec = 0;
+                    uint32_t comp_whole = 0, comp_dec = 0;
+
+                    if (total_input > 0) {
+                        /* System Efficiency = (Total Accepted / Total Input) * 100 */
+                        uint32_t eff_scaled = (total_accepted * 10000) / total_input;
+                        eff_whole = eff_scaled / 100;
+                        eff_dec   = eff_scaled % 100;
+
+                        /* Reject Rate = (Total Rejected / Total Input) * 100 */
+                        uint32_t rej_scaled = (total_rejected * 10000) / total_input;
+                        rej_whole = rej_scaled / 100;
+                        rej_dec   = rej_scaled % 100;
+                    }
+
+                    if (total_target > 0) {
+                        /* Target Completion Rate = (Total Accepted / Total Target) * 100 */
+                        uint32_t comp_scaled = (total_accepted * 10000) / total_target;
+                        comp_whole = comp_scaled / 100;
+                        comp_dec   = comp_scaled % 100;
+
+                        /* System Loss Rate = 100 - [(Total Accepted / Total Target) * 100] */
+                        uint32_t loss_scaled = (comp_scaled <= 10000) ? (10000 - comp_scaled) : 0;
+                        loss_whole = loss_scaled / 100;
+                        loss_dec   = loss_scaled % 100;
+                    }
+
                     sprintf(stringOut,
                             "\r\n========================================\r\n"
                             "SUMMARY REPORT\r\n"
                             "========================================\r\n"
-                            "ACCEPTED -> S: %d | M: %d | L: %d\r\n"
+                            "ACCEPTED -> S: %d/%d | M: %d/%d | L: %d/%d\r\n"
                             "REJECTED -> S: %d | M: %d | L: %d\r\n"
-                            "ERRORS -> IR Loss: %d | Unregistered LDR: %d | Stuck: %d\r\n"
+                            "ERRORS   -> Object Lost: %d | Unexpected Object: %d | Object Stuck: %d | Total Errors: %d\r\n"
+                            "----------------------------------------\r\n"
+                            "TOTAL INPUT  -> %lu\r\n"
+                            "TOTAL TARGET -> %lu\r\n"
                             "ELAPSED TIME -> %lu s\r\n"
+                            "----------------------------------------\r\n"
+                            "TARGET COMPLETION -> %lu.%02lu %%\r\n"
+                            "SYSTEM EFFICIENCY -> %lu.%02lu %%\r\n"
+                            "REJECT RATE       -> %lu.%02lu %%\r\n"
+                            "SYSTEM LOSS RATE  -> %lu.%02lu %%\r\n"
                             "========================================\r\n",
-                            count_S, count_M, count_L,
+                            count_S, target_S, count_M, target_M, count_L, target_L,
                             reject_S, reject_M, reject_L,
-                            err_ir_fault, err_ldr_fault, err_stuck,
-                            elapsed_time);
+                            err_ir_fault, err_ldr_fault, err_stuck, total_errors,
+                            total_input,
+                            total_target,
+                            elapsed_time,
+                            comp_whole, comp_dec,
+                            eff_whole, eff_dec,
+                            rej_whole, rej_dec,
+                            loss_whole, loss_dec);
+
                     UART2_TxString(stringOut);
                     report_printed = 1;
                 }
@@ -427,7 +484,7 @@ static void Process_IR_Event(void)
     package_active = 1;
     wait_ldr_start_time = msTicks;
     current_state = STATE_WAIT_LDR;
-    UART2_TxString("[SENSOR] IR -> Entry detected. Waiting for LDR sensor.\r\n");
+    UART2_TxString("[SENSOR] IR : Entry detected. Waiting for LDR sensor.\r\n");
 }
 
 static PackageSize Get_Pot_Size(uint16_t pot_val)
@@ -443,27 +500,15 @@ static void Process_Evaluate(uint16_t pot_val)
 
     if (current_size == SIZE_S) {
         current_decision = (count_S < target_S) ? DECISION_ACCEPT : DECISION_REJECT;
-        sprintf(stringOut,
-                "[EVAL] Size Measured: [ SMALL ]\r\n"
-                " Quota: %d | Accepted: %d | Rejected: %d\r\n",
-                target_S, count_S, reject_S);
-        UART2_TxString(stringOut);
+        UART2_TxString("[EVAL] Size Measured: [ SMALL ]\r\n");
     }
     else if (current_size == SIZE_M) {
         current_decision = (count_M < target_M) ? DECISION_ACCEPT : DECISION_REJECT;
-        sprintf(stringOut,
-                "[EVAL] Size Measured: [ MEDIUM ]\r\n"
-                " Quota: %d | Accepted: %d | Rejected: %d\r\n",
-                target_M, count_M, reject_M);
-        UART2_TxString(stringOut);
+        UART2_TxString("[EVAL] Size Measured: [ MEDIUM ]\r\n");
     }
     else {
         current_decision = (count_L < target_L) ? DECISION_ACCEPT : DECISION_REJECT;
-        sprintf(stringOut,
-                "[EVAL] Size Measured: [ LARGE ]\r\n"
-                " Quota: %d | Accepted: %d | Rejected: %d\r\n",
-                target_L, count_L, reject_L);
-        UART2_TxString(stringOut);
+        UART2_TxString("[EVAL] Size Measured: [ LARGE ]\r\n");
     }
 }
 
@@ -472,17 +517,17 @@ static void Process_Evaluate(uint16_t pot_val)
  *============================================================================*/
 static void Servo_Accept(void)
 {
-    TIM4->CCR3 = 150; // Position Center (90 deg)
+    TIM4->CCR3 = 150;
 }
 
 static void Servo_Reject(void)
 {
-    TIM4->CCR3 = 110; // Position Discard (~50 deg)
+    TIM4->CCR3 = 210;
 }
 
 static void Servo_Normal(void)
 {
-    TIM4->CCR3 = 150; // Reset Position
+    TIM4->CCR3 = 150;
 }
 
 /*==============================================================================
@@ -498,6 +543,7 @@ static uint8_t Targets_Complete(void)
 static void Enter_Fault(uint8_t reason)
 {
     package_active = 0;
+    ir_event_pending = 0;
     last_fault_reason = reason;
     fault_start_time = msTicks;
     resume_state = STATE_RUNNING;
@@ -511,13 +557,13 @@ static void Enter_Fault(uint8_t reason)
     }
     else if (reason == 2) {
         err_ldr_fault++;
-        UART2_TxString("\r\n[FAULT] Unregistered entry at LDR sensor without IR trigger!\r\n");
+        UART2_TxString("\r\n[FAULT] Unexpected LDR trigger without IR trigger!\r\n");
     }
     else {
         UART2_TxString("\r\n[FAULT] Package STUCK at sorting zone!\r\n");
     }
 
-    UART2_TxString("[SYS] System error. Press PAUSE (PB5) to resume or RESET (PB3).\r\n");
+    UART2_TxString("[SYS] System paused. Press PAUSE (PB5) to resume or RESET (PB3).\r\n");
     current_state = STATE_FAULT;
 }
 
@@ -526,19 +572,20 @@ static void Resume_From_Fault(void)
     fault_start_time = 0;
     last_printed_sec = 0xFFFFFFFF;
     current_state = STATE_RUNNING;
-    UART2_TxString("\r\n[SYS] Resuming from fault. Conveyor active.\r\n");
+    UART2_TxString("\r\n[SYS] Resuming from fault. Sorting reactivated.\r\n");
 }
 
 static void Enter_Emergency(void)
 {
     package_active = 0;
+    ir_event_pending = 0;
     Servo_Normal();
     led_pattern = LED_PATTERN_NONE;
     reset_flash_active = 0;
-    
+
     Set_Emergency_LEDs();
     current_state = STATE_EMERGENCY;
-    UART2_TxString("\r\n[EMERGENCY] STOP BUTTON PRESSED! All operations halted.\r\n");
+    UART2_TxString("\r\n[EMERGENCY] EMERGENCY BUTTON PRESSED! All operations halted.\r\n");
 }
 
 static void Pause_System(void)
@@ -546,7 +593,7 @@ static void Pause_System(void)
     resume_state = current_state;
     pause_start_time = msTicks;
     current_state = STATE_PAUSED;
-    UART2_TxString("\r\n[SYS] System PAUSED.\r\n");
+    UART2_TxString("\r\n[SYS] System PAUSED. Press PAUSE (PB5) to resume or RESET (PB3)\r\n");
 }
 
 static void Resume_System(void)
@@ -574,6 +621,9 @@ static void Start_Reset_Flash(void)
 
 static void Request_Reset_Report(void)
 {
+    package_active = 0;
+    ir_event_pending = 0;
+
     if (current_state == STATE_IDLE || current_state == STATE_READY) {
         Reset_To_Idle();
         return;
@@ -585,9 +635,6 @@ static void Request_Reset_Report(void)
     UART2_TxString("\r\n[SYS] RESET pressed. Finalizing report.\r\n");
 }
 
-/* -----------------------------------------------------------------------------
- * Reset_To_Idle: รีเซ็ตระบบทั้งหมดและล้างคอนฟิกเดิมออก ให้ส่งคอนฟิกใหม่จาก PC
- * ---------------------------------------------------------------------------*/
 static void Reset_To_Idle(void)
 {
     Servo_Normal();
@@ -595,13 +642,11 @@ static void Reset_To_Idle(void)
     Clear_All_LEDs();
     Reset_Metrics();
 
-    /* ล้างค่าคอนฟิกเป้าหมายทั้งหมด */
     target_S = 0;
     target_M = 0;
     target_L = 0;
     target_time = 0;
 
-    /* เคลียร์ Flag และ Buffer การรับค่าทาง UART */
     config_received = 0;
     rx_index = 0;
     memset((void*)rx_buffer, 0, sizeof(rx_buffer));
@@ -998,7 +1043,7 @@ void EXTI4_IRQHandler(void)
                 elapsed_time = 0;
                 last_printed_sec = 0xFFFFFFFF;
                 current_state = STATE_RUNNING;
-                UART2_TxString("\r\n[SYS] Conveyor Started!\r\n");
+                UART2_TxString("\r\n[SYS] Sorting Started!\r\n");
             }
         }
         EXTI->PR |= EXTI_PR_PR4;

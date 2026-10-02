@@ -1,20 +1,25 @@
 
 ปกติ
-Running Blue - LED 
+Running Blue - LED ค้
 -----------------------------
-IR - G LED
+IR - G LED  ค้
 -----------------------------
 LED
-S - red
-M - yellow
-L - green
+S - red     ค้
+M - yellow  ค้
+L - green   ค้
 -----------------------------
-Rejected - R LED
+Rejected - R LED    กพ
+S - red     กพ
+M - yellow  กพ
+L - green   กพ
+Servo - ขยับ
 -----------------------------
 
 ไม่ปกติ
 -----------------------------
 *Fault
+LED - blue  กพ
 -----------------------------
 object loss (IR Y LDR N)
 resume  runnning
@@ -41,8 +46,9 @@ ready (no report -> back to idle)
 others(report -> back to idle)
 -----------------------------
 Paused
+LED - blue  กพ
 resumed running
 timeout (report -> back to idle)
 -----------------------------
-Emergency (all led in board on)
-reset only
+Emergency (all led in board on ค้)
+reset only (all led in กพ)
