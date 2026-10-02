@@ -1,0 +1,48 @@
+
+ปกติ
+Running Blue - LED 
+-----------------------------
+IR - G LED
+-----------------------------
+LED
+S - red
+M - yellow
+L - green
+-----------------------------
+Rejected - R LED
+-----------------------------
+
+ไม่ปกติ
+-----------------------------
+*Fault
+-----------------------------
+object loss (IR Y LDR N)
+resume
+reset
+timeout
+-----------------------------
+unexpected object (IR N LDR Y)
+resume
+reset
+timeout
+-----------------------------
+Struck (IR Y LDR Y but LDR detected too long)
+resume
+reset
+timeout
+-----------------------------
+
+
+Button
+-----------------------------
+
+Manual Reset (all led on board on) 
+ready (no report -> back to idle)
+others(report -> back to idle)
+-----------------------------
+Paused
+resumed
+timeout (report -> back to idle)
+-----------------------------
+Emergency (all led in board on)
+reset only
