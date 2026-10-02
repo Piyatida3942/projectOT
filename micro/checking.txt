@@ -17,19 +17,19 @@ Rejected - R LED
 *Fault
 -----------------------------
 object loss (IR Y LDR N)
-resume
-reset
-timeout
+resume  runnning
+reset   (report -> back to idle)
+timeout (report -> back to idle)
 -----------------------------
 unexpected object (IR N LDR Y)
-resume
-reset
-timeout
+resume  running
+reset   (report -> back to idle)
+timeout (report -> back to idle)
 -----------------------------
 Struck (IR Y LDR Y but LDR detected too long)
-resume
-reset
-timeout
+resume  running
+reset   (report -> back to idle)
+timeout (report -> back to idle)
 -----------------------------
 
 
@@ -41,7 +41,7 @@ ready (no report -> back to idle)
 others(report -> back to idle)
 -----------------------------
 Paused
-resumed
+resumed running
 timeout (report -> back to idle)
 -----------------------------
 Emergency (all led in board on)
