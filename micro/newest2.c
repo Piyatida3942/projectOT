@@ -112,6 +112,7 @@ volatile uint32_t elapsed_time = 0;
 volatile uint32_t last_printed_sec = 0xFFFFFFFF;
 
 volatile uint32_t wait_ldr_start_time = 0;
+volatile uint32_t wait_led_hold_until = 0;   // ค้างไฟ Wait LDR ให้เห็นอย่างน้อย LED_HOLD_TIME_MS
 volatile uint32_t settle_start_time = 0;
 volatile uint32_t route_start_time = 0;
 volatile uint32_t ldr_clear_start_time = 0;
@@ -221,7 +222,10 @@ int main(void)
             if (current_state == STATE_EMERGENCY) {
                 Set_Emergency_LEDs();
             }
-            else if (current_state == STATE_WAIT_LDR) {
+            else if (current_state == STATE_WAIT_LDR ||
+                     ((int32_t)(wait_led_hold_until - msTicks) > 0 &&
+                      current_state != STATE_FAULT &&
+                      current_state != STATE_PAUSED)) {
                 GPIOA->BSRR = (1 << LED_STATUS_PIN);
                 Wait_LDR_LED_On();
             }
@@ -320,7 +324,7 @@ int main(void)
 
                     uint16_t q = (current_size == SIZE_S) ? target_S : (current_size == SIZE_M) ? target_M : target_L;
                     uint16_t a = (current_size == SIZE_S) ? count_S : (current_size == SIZE_M) ? count_M : count_L;
-                    sprintf(stringOut, "Quota: %d | Accepted: %d\r\n", q, a);
+                    sprintf(stringOut, "Quota: %d | Accepted: %d\r\n", q, a + 1);  // +1 = นับชิ้นนี้รวมแล้ว
                     UART2_TxString(stringOut);
                 }
                 else {
@@ -331,7 +335,7 @@ int main(void)
 
                     uint16_t q = (current_size == SIZE_S) ? target_S : (current_size == SIZE_M) ? target_M : target_L;
                     uint16_t r = (current_size == SIZE_S) ? reject_S : (current_size == SIZE_M) ? reject_M : reject_L;
-                    sprintf(stringOut, "Quota: %d | Rejected: %d\r\n", q, r);
+                    sprintf(stringOut, "Quota: %d | Rejected: %d\r\n", q, r + 1);  // +1 = นับชิ้นนี้รวมแล้ว
                     UART2_TxString(stringOut);
                 }
                 break;
@@ -483,6 +487,7 @@ static void Process_IR_Event(void)
 
     package_active = 1;
     wait_ldr_start_time = msTicks;
+    wait_led_hold_until = msTicks + LED_HOLD_TIME_MS;
     current_state = STATE_WAIT_LDR;
     UART2_TxString("[SENSOR] IR : Entry detected. Waiting for LDR sensor.\r\n");
 }
@@ -500,15 +505,15 @@ static void Process_Evaluate(uint16_t pot_val)
 
     if (current_size == SIZE_S) {
         current_decision = (count_S < target_S) ? DECISION_ACCEPT : DECISION_REJECT;
-        UART2_TxString("[EVAL] Size Measured: [ SMALL ]\r\n");
+        UART2_TxString("[EVAL] Size Measured: [ S ]\r\n");
     }
     else if (current_size == SIZE_M) {
         current_decision = (count_M < target_M) ? DECISION_ACCEPT : DECISION_REJECT;
-        UART2_TxString("[EVAL] Size Measured: [ MEDIUM ]\r\n");
+        UART2_TxString("[EVAL] Size Measured: [ M ]\r\n");
     }
     else {
         current_decision = (count_L < target_L) ? DECISION_ACCEPT : DECISION_REJECT;
-        UART2_TxString("[EVAL] Size Measured: [ LARGE ]\r\n");
+        UART2_TxString("[EVAL] Size Measured: [ L ]\r\n");
     }
 }
 
@@ -675,6 +680,7 @@ static void Reset_Metrics(void)
     pause_start_time = 0;
     fault_start_time = 0;
     wait_ldr_start_time = 0;
+    wait_led_hold_until = 0;
     settle_start_time = 0;
     route_start_time = 0;
     ldr_clear_start_time = 0;
