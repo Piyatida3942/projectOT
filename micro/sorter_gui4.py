@@ -41,6 +41,7 @@ class Model:
     def reset_all(self):
         self.state = "IDLE"
         self.prev_state = "RUNNING"
+        self.report_seq = 0           # incremented once per completed report
         self.stage = 0                      # number of completed pipeline steps
         self.target = {k: 0 for k in SIZES}
         self.time_limit = 0
@@ -200,6 +201,7 @@ class Model:
                 self.report[key] = m.group(1)
                 if key == "loss":
                     self.in_report = False
+                    self.report_seq += 1          # a complete report has arrived
                 return "report"
         if self.in_report and s.startswith(("=", "-")):
             return "report"
@@ -288,29 +290,34 @@ def demo_script(S, M, L, T):
 # ----------------------------------------------------------------------------
 # Theme
 # ----------------------------------------------------------------------------
-BG, CARD, BORDER = "#f6f7f9", "#ffffff", "#e8eaed"
-TXT, MUTED, FAINT = "#14181f", "#6b7280", "#9aa3af"
-BELT, BELT_EDGE, STRIPE = "#d9dde3", "#c4cad2", "#eef0f3"
-SIZE_COLOR = {"S": "#ef4444", "M": "#f59e0b", "L": "#22c55e"}
-ACCENT, REJ = "#2563eb", "#fb7185"
+BG, CARD, BORDER = "#f5f6f8", "#ffffff", "#e9ebef"
+TXT, MUTED, FAINT = "#15191f", "#6b7280", "#a3abb6"
+BELT, BELT_EDGE, STRIPE = "#dcdfe5", "#c7ccd4", "#f0f2f5"
+SIZE_COLOR = {"S": "#f87171", "M": "#fbbf24", "L": "#34d399"}
+SIZE_SOFT = {"S": "#fee2e2", "M": "#fef3c7", "L": "#d1fae5"}
+IR_C, IR_SOFT = "#38bdf8", "#e0f2fe"
+LDR_C, LDR_SOFT = "#a78bfa", "#ede9fe"
+ACCENT, ACCENT_SOFT = "#6366f1", "#eef2ff"
+REJ, REJ_SOFT = "#fb7185", "#ffe4e6"
 STATE_STYLE = {
-    "IDLE":      ("#64748b", "IDLE", "Waiting for configuration"),
-    "READY":     ("#2563eb", "READY", "Press START (PB4) on the board"),
-    "RUNNING":   ("#16a34a", "RUNNING", "Waiting for a package"),
-    "WAIT_LDR":  ("#0d9488", "WAIT LDR", "Package on the belt"),
-    "SETTLE":    ("#0d9488", "SETTLING", "Package at the sorting point"),
-    "EVALUATE":  ("#0d9488", "EVALUATING", "Measuring size"),
-    "ROUTE":     ("#0d9488", "ROUTING", "Servo moving the package"),
-    "PAUSED":    ("#d97706", "PAUSED", "Press PAUSE (PB5) to resume"),
-    "FAULT":     ("#dc2626", "FAULT", ""),
-    "EMERGENCY": ("#7f1d1d", "EMERGENCY", "All operations halted"),
-    "REPORT":    ("#7c3aed", "REPORT", "Summary report"),
+    "IDLE":      ("#7c8899", "IDLE", "Waiting for configuration"),
+    "READY":     ("#4f6ef7", "READY", "Press START (PB4) on the board"),
+    "RUNNING":   ("#22c55e", "RUNNING", "Waiting for a package"),
+    "WAIT_LDR":  ("#14b8a6", "WAIT LDR", "Package on the belt"),
+    "SETTLE":    ("#14b8a6", "SETTLING", "Package at the sorting point"),
+    "EVALUATE":  ("#14b8a6", "EVALUATING", "Measuring size"),
+    "ROUTE":     ("#14b8a6", "ROUTING", "Servo moving the package"),
+    "PAUSED":    ("#f59e0b", "PAUSED", "Press PAUSE (PB5) to resume"),
+    "FAULT":     ("#ef4444", "FAULT", ""),
+    "EMERGENCY": ("#991b1b", "EMERGENCY", "All operations halted"),
+    "REPORT":    ("#8b5cf6", "REPORT", "Summary report"),
 }
 LOG_TAGS = {
     "sys": MUTED, "dim": FAINT, "time": FAINT, "ok": "#15803d", "sensor": "#0e7490",
-    "eval": "#1d4ed8", "accept": "#16a34a", "reject": "#ea580c", "warn": "#b45309",
+    "eval": "#4338ca", "accept": "#16a34a", "reject": "#ea580c", "warn": "#b45309",
     "fault": "#dc2626", "emerg": "#991b1b", "report": "#6d28d9", "tx": ACCENT, "plain": TXT,
 }
+PKG_SIZE = {"S": 20, "M": 26, "L": 32, None: 22}
 
 
 # ----------------------------------------------------------------------------
@@ -319,37 +326,36 @@ LOG_TAGS = {
 class Geometry:
     """Computes every coordinate of the conveyor from the canvas size."""
 
-    def __init__(self, w=980, h=250):
+    def __init__(self, w=1000, h=300):
         self.resize(w, h)
 
     def resize(self, w, h):
-        self.w, self.h = max(w, 560), max(h, 200)
+        self.w, self.h = max(w, 620), max(h, 240)
         self.belt_y = self.h * 0.40
-        self.x0 = 54                       # belt start (entry)
-        self.x1 = self.w - 26              # belt end
+        self.belt_t = 30                       # belt thickness
+        self.x0 = 66                           # belt start (entry)
+        self.x1 = self.w - 28                  # belt end
         span = self.x1 - self.x0
-        self.bin_top = self.belt_y + 46
-        self.bin_h = max(44, self.h - self.bin_top - 24)
+        self.bin_top = self.belt_y + 62
+        self.bin_h = max(66, self.h - self.bin_top - 20)
 
-        # 4 bins (reject + S/M/L) share the right-hand half; the belt's left
-        # half holds the entry, IR and LDR stations.
-        gap = 10
-        bw = min(84.0, (span * 0.58 - 3 * gap) / 4)
-        self.bin_w = bw
+        # 4 bins (reject + S/M/L) share the right-hand part of the belt
+        gap = 12
+        self.bin_w = min(104.0, (span * 0.60 - 3 * gap) / 4)
         right = self.x1 - 6
-        self.bin_x = {k: right - bw * (3 - i) - gap * (2 - i)     # S, M, L left->right
+        self.bin_x = {k: right - self.bin_w * (3 - i) - gap * (2 - i)   # S, M, L
                       for i, k in enumerate(SIZES)}
-        self.rej_x = self.bin_x["S"] - gap - bw                   # reject sits left of S
-        self.gate_x = self.rej_x + bw / 2                         # servo above reject bin
+        self.rej_x = self.bin_x["S"] - gap - self.bin_w
+        self.gate_x = self.rej_x + self.bin_w / 2
         left = self.gate_x - self.x0
         self.ir_x = self.x0 + left * 0.26
-        self.ldr_x = self.x0 + left * 0.66
+        self.ldr_x = self.x0 + left * 0.64
 
     def point(self, name):
         """Waypoint name -> (x, y) on the canvas."""
         by = self.belt_y
         if name == "entry":
-            return (self.x0 - 24, by)
+            return (self.x0 - 30, by)
         if name == "ir":
             return (self.ir_x, by)
         if name == "ldr":
@@ -357,13 +363,11 @@ class Geometry:
         if name == "gate":
             return (self.gate_x, by)
         if name == "rej_in":
-            return (self.rej_x + self.bin_w / 2, self.bin_top + self.bin_h * 0.55)
+            return (self.rej_x + self.bin_w / 2, self.bin_top + self.bin_h * 0.52)
         if name.startswith("bin_"):
-            k = name[4]
-            return (self.bin_x[k] + self.bin_w / 2, by)
+            return (self.bin_x[name[4]] + self.bin_w / 2, by)
         if name.startswith("drop_"):
-            k = name[5]
-            return (self.bin_x[k] + self.bin_w / 2, self.bin_top + self.bin_h * 0.55)
+            return (self.bin_x[name[5]] + self.bin_w / 2, self.bin_top + self.bin_h * 0.52)
         raise KeyError(name)
 
 
@@ -380,37 +384,38 @@ def step_towards(x, y, tx, ty, dt=1 / 30):
     dist = math.hypot(dx, dy)
     if dist < 1.5:
         return tx, ty, True
-    speed = max(150.0, dist * 4.0)          # px per second
+    speed = max(150.0, dist * 4.0)             # px per second
     stepd = min(dist, speed * dt)
     return x + dx / dist * stepd, y + dy / dist * stepd, False
 
 
 class ConveyorView:
-    """Draws the belt, sensors, servo gate, bins and the travelling package."""
+    """Belt, sensors, servo gate, bins and the travelling package."""
 
     def __init__(self, parent, model):
         self.model = model
         self.g = Geometry()
-        self.canvas = tk.Canvas(parent, bg=CARD, highlightthickness=0, height=250)
+        self.canvas = tk.Canvas(parent, bg=CARD, highlightthickness=0, height=300)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_resize)
         self.stripe = 0.0
-        self.pkg = None          # dict(x, y, size, decision, path, mode, seen)
+        self.roller = 0.0
+        self.pkg = None            # dict(x, y, size, decision, path, mode, seen)
         self.flash = 0.0
 
     # -- events ------------------------------------------------------------
     def _on_resize(self, e):
         old_w, old_h = self.g.w, self.g.h
         self.g.resize(e.width, e.height)
-        if self.pkg:             # keep the package roughly where it was
+        if self.pkg:               # keep the package roughly where it was
             self.pkg["x"] *= self.g.w / old_w
             self.pkg["y"] *= self.g.h / old_h
 
     def sync(self):
         """Pull new state out of the model and update the package path."""
         m = self.model
-        if m.state in ("EMERGENCY", "IDLE", "READY") or (m.state == "REPORT" and self.pkg
-                                                         and self.pkg["mode"] != "run"):
+        if m.state in ("EMERGENCY", "IDLE", "READY") or (
+                m.state == "REPORT" and self.pkg and self.pkg["mode"] != "run"):
             self.pkg = None
             return
         if m.stage >= 1 and self.pkg is None:
@@ -436,10 +441,15 @@ class ConveyorView:
             p["path"] = route_for(m.last_decision, m.last_size or "M")
             p["seen"] = 4
 
+    def belt_is_moving(self):
+        """The belt only runs while a package is actually travelling on it."""
+        p = self.pkg
+        return bool(p and p["mode"] == "run" and self.model.state in ACTIVE)
+
     def tick(self, dt=1 / 30):
-        m = self.model
-        if m.state in ACTIVE:
-            self.stripe = (self.stripe + 110 * dt) % 26
+        if self.belt_is_moving():
+            self.stripe = (self.stripe + 120 * dt) % 30
+            self.roller = (self.roller + 260 * dt) % 360
         self.flash = (self.flash + dt) % 1.0
         p = self.pkg
         if p and p["mode"] == "run" and p["path"]:
@@ -455,7 +465,7 @@ class ConveyorView:
 
     # -- drawing -----------------------------------------------------------
     def _round(self, x0, y0, x1, y1, r, **kw):
-        r = max(1, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        r = max(1.0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
         pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
                x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
         return self.canvas.create_polygon(pts, smooth=True, **kw)
@@ -463,78 +473,195 @@ class ConveyorView:
     def draw(self):
         c, g, m = self.canvas, self.g, self.model
         c.delete("all")
-        by, h = g.belt_y, 22
+        by, t = g.belt_y, g.belt_t
         dim = m.state == "EMERGENCY"
+        running = self.belt_is_moving()
 
-        # belt
-        self._round(g.x0, by - h / 2, g.x1, by + h / 2, 10,
+        # belt body + rollers
+        self._round(g.x0, by - t / 2, g.x1, by + t / 2, t / 2,
                     fill="#eceef1" if dim else BELT, outline=BELT_EDGE)
-        x = g.x0 + 8 + self.stripe
-        while x < g.x1 - 6:
-            c.create_line(x, by - h / 2 + 4, x - 8, by + h / 2 - 4, fill=STRIPE, width=3)
-            x += 26
-        c.create_line(g.x0, by + h / 2 + 7, g.x1, by + h / 2 + 7, fill=BORDER)
+        if running:
+            x = g.x0 + 10 + self.stripe
+            while x < g.x1 - 8:
+                c.create_line(x, by - t / 2 + 5, x - 10, by + t / 2 - 5,
+                              fill=STRIPE, width=4)
+                x += 30
+        for rx in (g.x0 + t / 2 - 2, g.x1 - t / 2 + 2):
+            c.create_oval(rx - t / 2, by - t / 2, rx + t / 2, by + t / 2,
+                          fill="#f7f8fa", outline=BELT_EDGE, width=2)
+            a = math.radians(self.roller if running else 0)
+            c.create_line(rx - (t / 2 - 6) * math.cos(a), by - (t / 2 - 6) * math.sin(a),
+                          rx + (t / 2 - 6) * math.cos(a), by + (t / 2 - 6) * math.sin(a),
+                          fill=BELT_EDGE, width=3)
+        c.create_line(g.x0, by + t / 2 + 9, g.x1, by + t / 2 + 9, fill=BORDER, width=2)
 
-        # entry arrow
-        c.create_text(g.x0 - 20, by - 24, text="IN", fill=FAINT, font=("Segoe UI", 8, "bold"))
-        c.create_line(g.x0 - 34, by, g.x0 - 6, by, fill=FAINT, width=2, arrow="last")
+        # entry
+        c.create_text(g.x0 - 34, by - 32, text="IN", fill=FAINT, font=("Segoe UI", 10, "bold"))
+        c.create_line(g.x0 - 46, by, g.x0 - 10, by, fill=FAINT, width=3,
+                      arrow="last", arrowshape=(10, 12, 5))
+        if m.state in ACTIVE and self.pkg is None and not dim:
+            c.create_text((g.x0 + g.gate_x) / 2, by, text="waiting for a package …",
+                          fill=FAINT, font=("Segoe UI", 11))
 
         # sensors
-        self._sensor(g.ir_x, by, "IR", m.stage >= 1 and m.state in ACTIVE, "#0ea5e9")
-        self._sensor(g.ldr_x, by, "LDR", m.stage >= 2 and m.state in ACTIVE, "#8b5cf6")
+        self._sensor(g.ir_x, by, "IR", m.stage >= 1 and m.state in ACTIVE, IR_C, IR_SOFT)
+        self._sensor(g.ldr_x, by, "LDR", m.stage >= 2 and m.state in ACTIVE, LDR_C, LDR_SOFT)
 
         # servo gate
         rejecting = bool(self.pkg and self.pkg.get("decision") == "REJECT")
-        gx = g.gate_x
-        c.create_line(gx, by - 34, gx, by - h / 2 - 2, fill=BORDER, width=2)
-        ang = math.radians(55 if rejecting else 0)
-        ln = 26
-        c.create_line(gx, by - 30, gx + ln * math.cos(ang), by - 30 + ln * math.sin(ang),
-                      fill=REJ if rejecting else FAINT, width=5, capstyle="round")
-        c.create_oval(gx - 4, by - 34, gx + 4, by - 26, fill=CARD,
-                      outline=REJ if rejecting else FAINT, width=2)
-        c.create_text(gx, by - 46, text="SERVO", fill=FAINT, font=("Segoe UI", 8, "bold"))
+        col = REJ if rejecting else FAINT
+        gx, gy = g.gate_x, by - t / 2 - 34
+        c.create_line(gx, gy + 6, gx, by - t / 2 - 2, fill=BORDER, width=3)
+        ang = math.radians(58 if rejecting else 0)
+        ln = 40
+        c.create_line(gx, gy, gx + ln * math.cos(ang), gy + ln * math.sin(ang),
+                      fill=col, width=8, capstyle="round")
+        c.create_oval(gx - 9, gy - 9, gx + 9, gy + 9, fill=REJ_SOFT if rejecting else CARD,
+                      outline=col, width=3)
+        c.create_text(gx, gy - 24, text="SERVO", fill=col, font=("Segoe UI", 10, "bold"))
 
         # bins
         for k in SIZES:
-            self._bin(g.bin_x[k], g.bin_top, g.bin_w, g.bin_h, SIZE_COLOR[k], k,
-                      f"{m.accepted[k]}/{m.target[k]}", "ACCEPT")
-        self._bin(g.rej_x, g.bin_top, g.bin_w, g.bin_h, REJ, "✕",
-                  str(sum(m.rejected.values())), "REJECT")
+            self._bin(g.bin_x[k], g.bin_top, g.bin_w, g.bin_h, SIZE_COLOR[k], SIZE_SOFT[k],
+                      k, f"{m.accepted[k]}/{m.target[k]}", "ACCEPT")
+        self._bin(g.rej_x, g.bin_top, g.bin_w, g.bin_h, REJ, REJ_SOFT,
+                  "✕", str(sum(m.rejected.values())), "REJECT")
 
-        # package
-        p = self.pkg
-        if p:
-            col = SIZE_COLOR.get(p["size"], "#94a3b8")
-            if p["mode"] == "fault":
-                col = "#dc2626" if self.flash < 0.5 else "#fca5a5"
-            s = {"S": 11, "M": 14, "L": 18}.get(p["size"], 13)
-            x, y = p["x"], p["y"]
-            self._round(x - s, y - s, x + s, y + s, 5, fill=col, outline="")
-            c.create_line(x - s, y, x + s, y, fill="#ffffff", width=2)
-            lbl = "!" if p["mode"] == "fault" else (p["size"] or "?")
-            c.create_text(x, y - s - 11, text=lbl, fill=col, font=("Segoe UI", 10, "bold"))
-
+        if self.pkg:
+            self._package(self.pkg)
         if dim:
+            self._round(g.w / 2 - 130, by - 26, g.w / 2 + 130, by + 26, 14,
+                        fill="#fee2e2", outline="#ef4444", width=2)
             c.create_text(g.w / 2, by, text="EMERGENCY STOP", fill="#b91c1c",
-                          font=("Segoe UI", 20, "bold"))
+                          font=("Segoe UI", 18, "bold"))
 
-    def _sensor(self, x, by, name, on, color):
-        c = self.canvas
-        c.create_line(x, by - 30, x, by - 14, fill=color if on else BORDER, width=2)
-        c.create_oval(x - 6, by - 38, x + 6, by - 26,
-                      fill=color if on else CARD, outline=color if on else BORDER, width=2)
-        c.create_text(x, by - 50, text=name, fill=color if on else FAINT,
-                      font=("Segoe UI", 8, "bold"))
+    def _sensor(self, x, by, name, on, color, soft):
+        c, t = self.canvas, self.g.belt_t
+        top = by - t / 2 - 30
+        c.create_line(x, top + 14, x, by - t / 2 - 2, fill=color if on else BORDER, width=3)
+        if on:                                            # soft glow ring
+            c.create_oval(x - 20, top - 20, x + 20, top + 20, fill=soft, outline="")
+        c.create_oval(x - 13, top - 13, x + 13, top + 13,
+                      fill=color if on else CARD, outline=color if on else BORDER, width=3)
+        if on:
+            c.create_oval(x - 5, top - 7, x + 1, top - 1, fill="#ffffff", outline="")
+        c.create_text(x, top - 30, text=name, fill=color if on else FAINT,
+                      font=("Segoe UI", 11, "bold"))
 
-    def _bin(self, x, y, w, h, color, label, count, kind):
+    def _bin(self, x, y, w, h, color, soft, label, count, kind):
         c = self.canvas
-        c.create_line(x + w / 2, y - 36, x + w / 2, y - 4, fill=BORDER, width=1, dash=(3, 3))
-        self._round(x, y, x + w, y + h, 8, fill=CARD, outline=color, width=2)
-        c.create_rectangle(x + 2, y + h - 7, x + w - 2, y + h - 2, fill=color, outline="")
-        c.create_text(x + w / 2, y + 15, text=label, fill=color, font=("Segoe UI", 12, "bold"))
-        c.create_text(x + w / 2, y + h / 2 + 8, text=count, fill=TXT, font=("Consolas", 13, "bold"))
-        c.create_text(x + w / 2, y + h - 16, text=kind, fill=FAINT, font=("Segoe UI", 7, "bold"))
+        c.create_line(x + w / 2, y - 46, x + w / 2, y - 6, fill=BORDER, width=2, dash=(4, 4))
+        self._round(x, y, x + w, y + h, 12, fill=soft, outline=color, width=2)
+        self._round(x + 6, y + h - 12, x + w - 6, y + h - 4, 4, fill=color, outline="")
+        c.create_oval(x + w / 2 - 15, y + 7, x + w / 2 + 15, y + 37, fill=color, outline="")
+        c.create_text(x + w / 2, y + 22, text=label, fill="#ffffff", font=("Segoe UI", 14, "bold"))
+        c.create_text(x + w / 2, y + 52, text=count, fill=TXT, font=("Consolas", 16, "bold"))
+        c.create_text(x + w / 2, y + h - 22, text=kind, fill=MUTED, font=("Segoe UI", 8, "bold"))
+
+    def _package(self, p):
+        c = self.canvas
+        col = SIZE_COLOR.get(p["size"], "#cbd5e1")
+        if p["mode"] == "fault":
+            col = "#ef4444" if self.flash < 0.5 else "#fecaca"
+        s = PKG_SIZE.get(p["size"], PKG_SIZE[None])
+        x, y = p["x"], p["y"]
+        c.create_oval(x - s * 0.9, y + s - 3, x + s * 0.9, y + s + 5,
+                      fill="#e5e7eb", outline="")                       # soft shadow
+        self._round(x - s, y - s, x + s, y + s, 8, fill=col, outline="")
+        self._round(x - s + 4, y - s + 4, x + s - 4, y - s + 10, 3,
+                    fill="#ffffff", outline="")                          # highlight
+        c.create_line(x - s, y, x + s, y, fill="#ffffff", width=3)       # tape
+        c.create_line(x, y - s, x, y + s, fill="#ffffff", width=3)
+        lbl = "!" if p["mode"] == "fault" else (p["size"] or "?")
+        c.create_text(x, y - s - 14, text=lbl, fill=col, font=("Segoe UI", 12, "bold"))
+
+
+# ----------------------------------------------------------------------------
+# Summary report pop-up
+# ----------------------------------------------------------------------------
+def report_rows(m):
+    """Builds the lines shown in the pop-up. Pure data, so it can be tested."""
+    rows = [("ACCEPTED", None)]
+    for k in SIZES:
+        hit = m.accepted[k] >= m.target[k] and m.target[k] > 0
+        rows.append((f"Size {k}", f"{m.accepted[k]} / {m.target[k]}", SIZE_COLOR[k], hit))
+    rows.append(("REJECTED", None))
+    for k in SIZES:
+        rows.append((f"Size {k}", str(m.rejected[k]), REJ, None))
+    rows.append(("ERRORS", None))
+    for lab, key in (("Object Lost", "lost"), ("Unexpected Object", "unexpected"),
+                     ("Object Stuck", "stuck")):
+        rows.append((lab, str(m.errors[key]), MUTED, None))
+    rows.append(("TOTALS", None))
+    r = m.report
+    tot_in = sum(m.accepted.values()) + sum(m.rejected.values()) + sum(m.errors.values())
+    rows.append(("Total Input", r.get("input", str(tot_in)), TXT, None))
+    rows.append(("Total Target", r.get("total_target", str(sum(m.target.values()))), TXT, None))
+    rows.append(("Elapsed Time", r.get("elapsed", "-") + " s", TXT, None))
+    rows.append(("RATES", None))
+    for lab, key in (("Target Completion", "completion"), ("System Efficiency", "efficiency"),
+                     ("Reject Rate", "reject_rate"), ("System Loss Rate", "loss")):
+        rows.append((lab, (r[key] + " %") if key in r else "-", TXT, None))
+    return rows
+
+
+class ReportDialog(tk.Toplevel):
+    """Shown automatically when the board finishes printing its summary."""
+
+    def __init__(self, master, model, on_save):
+        super().__init__(master)
+        self.title("Summary Report")
+        self.configure(bg=CARD)
+        self.resizable(False, False)
+        self.transient(master)
+
+        comp = model.report.get("completion")
+        done = comp is not None and float(comp) >= 100.0
+        head_col = "#22c55e" if done else "#f59e0b"
+        head = tk.Frame(self, bg=head_col)
+        head.pack(fill="x")
+        tk.Label(head, text="SUMMARY REPORT", bg=head_col, fg="white",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=24, pady=(16, 0))
+        tk.Label(head, text=("ALL TARGETS REACHED" if done else "RUN ENDED"), bg=head_col,
+                 fg="white", font=("Segoe UI", 21, "bold")).pack(anchor="w", padx=24)
+        tk.Label(head, text=f"Target completion   {comp or '-'} %", bg=head_col, fg="white",
+                 font=("Segoe UI", 11)).pack(anchor="w", padx=24, pady=(0, 16))
+
+        body = tk.Frame(self, bg=CARD)
+        body.pack(fill="both", expand=True, padx=24, pady=16)
+        body.columnconfigure(1, weight=1)
+        r = 0
+        for row in report_rows(model):
+            if row[1] is None:
+                tk.Label(body, text=row[0], bg=CARD, fg=FAINT, font=("Segoe UI", 8, "bold")).grid(
+                    row=r, column=0, sticky="w", pady=(14 if r else 0, 2))
+            else:
+                lab, val, col, hit = row
+                tk.Label(body, text=lab, bg=CARD, fg=MUTED,
+                         font=("Segoe UI", 10)).grid(row=r, column=0, sticky="w", pady=2)
+                tk.Label(body, text=val, bg=CARD, fg=col, font=("Consolas", 13, "bold")).grid(
+                    row=r, column=1, sticky="e", padx=(48, 10))
+                if hit is not None:
+                    tk.Label(body, text="✓" if hit else "✕", bg=CARD,
+                             fg="#16a34a" if hit else "#ef4444",
+                             font=("Segoe UI", 12, "bold")).grid(row=r, column=2, sticky="e")
+            r += 1
+
+        btns = tk.Frame(self, bg=CARD)
+        btns.pack(fill="x", padx=24, pady=(0, 18))
+        ttk.Button(btns, text="Save log", command=on_save).pack(side="left")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        try:                        # centre over the main window
+            x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+            y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+            self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except tk.TclError:
+            pass
+        self.lift()
+        self.focus_force()
 
 
 # ----------------------------------------------------------------------------
@@ -544,8 +671,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Package Sorting System - Dashboard")
-        self.geometry("1040x930")
-        self.minsize(900, 760)
+        self.geometry("1060x960")
+        self.minsize(940, 720)
         self.configure(bg=BG)
         self.model = Model()
         self.q = queue.Queue()
@@ -553,6 +680,8 @@ class App(tk.Tk):
         self.stop_evt = threading.Event()
         self.demo_iter = None
         self.demo_job = None
+        self.report_shown = 0          # last model.report_seq already popped up
+        self.report_win = None
         self._style()
         self._build()
         self._refresh_ports()
@@ -569,25 +698,53 @@ class App(tk.Tk):
         except tk.TclError:
             pass
         for k, col in SIZE_COLOR.items():
-            st.configure(f"{k}.Horizontal.TProgressbar", troughcolor="#edeff2", background=col,
-                         bordercolor="#edeff2", lightcolor=col, darkcolor=col, thickness=7)
-        st.configure("TButton", padding=(10, 4))
+            st.configure(f"{k}.Horizontal.TProgressbar", troughcolor="#eef0f3", background=col,
+                         bordercolor="#eef0f3", lightcolor=col, darkcolor=col, thickness=8)
+        st.configure("TButton", padding=(12, 5))
+        st.configure("Go.TButton", padding=(18, 8), font=("Segoe UI", 10, "bold"))
 
     def _card(self, parent, title=None):
         f = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         if title:
             tk.Label(f, text=title, bg=CARD, fg=FAINT,
-                     font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=14, pady=(9, 0))
+                     font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=16, pady=(10, 0))
         return f
 
+    def _stepper(self, parent, key, label, color, soft, default, hi):
+        """A chunky +/- number box used by the configuration card."""
+        box = tk.Frame(parent, bg=soft, highlightthickness=1, highlightbackground=color)
+        tk.Label(box, text=label, bg=soft, fg=color,
+                 font=("Segoe UI", 10, "bold")).pack(pady=(8, 0))
+        var = tk.IntVar(value=default)
+        self.cfg_vars[key] = var
+        ent = tk.Entry(box, textvariable=var, width=4, justify="center", relief="flat",
+                       bg=soft, fg=TXT, font=("Consolas", 26, "bold"),
+                       highlightthickness=0, bd=0)
+        ent.pack(padx=14)
+
+        def bump(d):
+            try:
+                v = var.get()
+            except tk.TclError:
+                v = 0
+            var.set(max(0, min(hi, v + d)))
+        brow = tk.Frame(box, bg=soft)
+        brow.pack(pady=(2, 10))
+        for txt, d in (("−", -1), ("+", 1)):
+            tk.Button(brow, text=txt, width=2, relief="flat", bg=CARD, fg=color,
+                      activebackground=color, activeforeground="white", bd=0,
+                      font=("Segoe UI", 12, "bold"), cursor="hand2",
+                      command=lambda d=d: bump(d)).pack(side="left", padx=4)
+        return box
+
     def _build(self):
-        pad = dict(padx=14)
+        pad = dict(padx=16)
 
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", pady=(12, 6), **pad)
         tk.Label(bar, text="Port", bg=BG, fg=MUTED).pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_cb = ttk.Combobox(bar, textvariable=self.port_var, width=32, state="readonly")
+        self.port_cb = ttk.Combobox(bar, textvariable=self.port_var, width=30, state="readonly")
         self.port_cb.pack(side="left", padx=5)
         ttk.Button(bar, text="Refresh", command=self._refresh_ports).pack(side="left")
         tk.Label(bar, text="Baud", bg=BG, fg=MUTED).pack(side="left", padx=(10, 3))
@@ -598,23 +755,30 @@ class App(tk.Tk):
         self.conn_btn.pack(side="left", padx=8)
         self.demo_btn = ttk.Button(bar, text="Demo", command=self._toggle_demo)
         self.demo_btn.pack(side="left")
+        self.popup_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(bar, text="Pop-up report", variable=self.popup_var, bg=BG, fg=MUTED,
+                       activebackground=BG, selectcolor=CARD).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Show report", command=self._show_report).pack(side="left", padx=4)
         self.link_lbl = tk.Label(bar, text="● Disconnected", bg=BG, fg=FAINT)
         self.link_lbl.pack(side="right")
 
         # banner
-        self.banner = tk.Frame(self, bg="#64748b")
+        self.banner = tk.Frame(self, bg="#7c8899")
         self.banner.pack(fill="x", pady=6, **pad)
-        left = tk.Frame(self.banner, bg="#64748b")
-        left.pack(side="left", padx=20, pady=14)
-        self.state_lbl = tk.Label(left, text="IDLE", font=("Segoe UI", 26, "bold"), fg="white", bg="#64748b")
+        left = tk.Frame(self.banner, bg="#7c8899")
+        left.pack(side="left", padx=22, pady=15)
+        self.state_lbl = tk.Label(left, text="IDLE", font=("Segoe UI", 27, "bold"),
+                                  fg="white", bg="#7c8899")
         self.state_lbl.pack(anchor="w")
-        self.sub_lbl = tk.Label(left, text="", font=("Segoe UI", 10), fg="white", bg="#64748b")
+        self.sub_lbl = tk.Label(left, text="", font=("Segoe UI", 10), fg="white", bg="#7c8899")
         self.sub_lbl.pack(anchor="w")
-        right = tk.Frame(self.banner, bg="#64748b")
-        right.pack(side="right", padx=20)
-        self.time_cap = tk.Label(right, text="TIME REMAINING", font=("Segoe UI", 8, "bold"), fg="white", bg="#64748b")
+        right = tk.Frame(self.banner, bg="#7c8899")
+        right.pack(side="right", padx=22)
+        self.time_cap = tk.Label(right, text="TIME REMAINING", font=("Segoe UI", 8, "bold"),
+                                 fg="white", bg="#7c8899")
         self.time_cap.pack(anchor="e")
-        self.time_lbl = tk.Label(right, text="--", font=("Consolas", 28, "bold"), fg="white", bg="#64748b")
+        self.time_lbl = tk.Label(right, text="--", font=("Consolas", 29, "bold"),
+                                 fg="white", bg="#7c8899")
         self.time_lbl.pack(anchor="e")
         self._banner_widgets = [self.banner, left, right, self.state_lbl, self.sub_lbl,
                                 self.time_cap, self.time_lbl]
@@ -623,10 +787,10 @@ class App(tk.Tk):
         conv = self._card(self, "CONVEYOR")
         conv.pack(fill="x", pady=6, **pad)
         holder = tk.Frame(conv, bg=CARD)
-        holder.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        holder.pack(fill="both", expand=True, padx=12, pady=(4, 6))
         self.conveyor = ConveyorView(holder, self.model)
-        self.pkg_lbl = tk.Label(conv, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 9))
-        self.pkg_lbl.pack(anchor="w", padx=14, pady=(0, 8))
+        self.pkg_lbl = tk.Label(conv, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 10))
+        self.pkg_lbl.pack(anchor="w", padx=16, pady=(0, 10))
 
         # size cards
         row = tk.Frame(self, bg=BG)
@@ -635,78 +799,95 @@ class App(tk.Tk):
         for i, k in enumerate(SIZES):
             row.columnconfigure(i, weight=1, uniform="c")
             c = self._card(row)
-            c.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
-            tk.Frame(c, bg=SIZE_COLOR[k], height=4).pack(fill="x")
-            tk.Label(c, text=f"SIZE {k}", bg=CARD, fg=FAINT,
-                     font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=14, pady=(7, 0))
-            big = tk.Label(c, text="0 / 0", bg=CARD, fg=TXT, font=("Consolas", 24, "bold"))
-            big.pack(anchor="w", padx=14)
+            c.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            tk.Frame(c, bg=SIZE_COLOR[k], height=5).pack(fill="x")
+            head = tk.Frame(c, bg=CARD)
+            head.pack(fill="x", padx=16, pady=(9, 0))
+            dot = tk.Canvas(head, width=18, height=18, bg=CARD, highlightthickness=0)
+            dot.create_oval(1, 1, 17, 17, fill=SIZE_COLOR[k], outline="")
+            dot.create_text(9, 9, text=k, fill="white", font=("Segoe UI", 8, "bold"))
+            dot.pack(side="left")
+            tk.Label(head, text=f"SIZE {k}", bg=CARD, fg=FAINT,
+                     font=("Segoe UI", 8, "bold")).pack(side="left", padx=6)
+            big = tk.Label(c, text="0 / 0", bg=CARD, fg=TXT, font=("Consolas", 25, "bold"))
+            big.pack(anchor="w", padx=16)
             pb = ttk.Progressbar(c, style=f"{k}.Horizontal.TProgressbar", maximum=1, value=0)
-            pb.pack(fill="x", padx=14, pady=5)
+            pb.pack(fill="x", padx=16, pady=6)
             rj = tk.Label(c, text="Rejected: 0", bg=CARD, fg="#ea580c", font=("Segoe UI", 9))
-            rj.pack(anchor="w", padx=14, pady=(0, 11))
+            rj.pack(anchor="w", padx=16, pady=(0, 12))
             self.cards[k] = (big, pb, rj)
 
         # middle
         mid = tk.Frame(self, bg=BG)
         mid.pack(fill="x", pady=6, **pad)
-        mid.columnconfigure(0, weight=1, uniform="m")
-        mid.columnconfigure(1, weight=1, uniform="m")
+        mid.columnconfigure(0, weight=3, uniform="m")
+        mid.columnconfigure(1, weight=2, uniform="m")
 
         lf = tk.Frame(mid, bg=BG)
         lf.grid(row=0, column=0, sticky="nsew")
-        cfg = self._card(lf, "CONFIGURATION  (board accepts it in IDLE only)")
+        cfg = self._card(lf, "CONFIGURATION  ·  the board accepts it in IDLE only")
         cfg.pack(fill="x")
         cr = tk.Frame(cfg, bg=CARD)
-        cr.pack(fill="x", padx=14, pady=9)
+        cr.pack(fill="x", padx=16, pady=(6, 14))
         self.cfg_vars = {}
-        for lab, default, hi in (("S", 2, 99), ("M", 2, 99), ("L", 2, 99), ("T (s)", 30, 9999)):
-            tk.Label(cr, text=lab, bg=CARD, fg=MUTED).pack(side="left", padx=(0, 3))
-            v = tk.IntVar(value=default)
-            ttk.Spinbox(cr, from_=0, to=hi, width=5, textvariable=v).pack(side="left", padx=(0, 9))
-            self.cfg_vars[lab] = v
-        ttk.Button(cr, text="Send Config", command=self._send_config).pack(side="left")
+        specs = (("S", "SIZE S", SIZE_COLOR["S"], SIZE_SOFT["S"], 2, 99),
+                 ("M", "SIZE M", SIZE_COLOR["M"], SIZE_SOFT["M"], 2, 99),
+                 ("L", "SIZE L", SIZE_COLOR["L"], SIZE_SOFT["L"], 2, 99),
+                 ("T (s)", "TIME (s)", ACCENT, ACCENT_SOFT, 30, 9999))
+        for i, (key, lab, col, soft, dv, hi) in enumerate(specs):
+            cr.columnconfigure(i, weight=1, uniform="s")
+            self._stepper(cr, key, lab, col, soft, dv, hi).grid(
+                row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
+        ttk.Button(cfg, text="Send Config  ➜", style="Go.TButton",
+                   command=self._send_config).pack(anchor="e", padx=16, pady=(0, 14))
 
-        hist = self._card(lf, "HISTORY  (latest right, ✕ = rejected)")
-        hist.pack(fill="x", pady=(8, 0))
-        self.hist = tk.Canvas(hist, height=34, bg=CARD, highlightthickness=0)
-        self.hist.pack(fill="x", padx=14, pady=(4, 10))
+        hist = self._card(lf, "HISTORY  ·  latest right, ✕ = rejected")
+        hist.pack(fill="x", pady=(10, 0))
+        self.hist = tk.Canvas(hist, height=40, bg=CARD, highlightthickness=0)
+        self.hist.pack(fill="x", padx=16, pady=(4, 12))
 
         rc = self._card(mid, "ERRORS & REPORT")
-        rc.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        rc.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         grid = tk.Frame(rc, bg=CARD)
-        grid.pack(fill="both", expand=True, padx=14, pady=9)
+        grid.pack(fill="both", expand=True, padx=16, pady=(6, 14))
         grid.columnconfigure(1, weight=1)
         self.rep_vars = {}
-        items = (("Object Lost", "lost"), ("Unexpected Object", "unexpected"), ("Object Stuck", "stuck"),
-                 ("Total Input", "input"), ("Total Target", "total_target"), ("Elapsed", "elapsed"),
-                 ("Target Completion", "completion"), ("System Efficiency", "efficiency"),
-                 ("Reject Rate", "reject_rate"), ("System Loss Rate", "loss"))
-        for i, (lab, key) in enumerate(items):
-            r = i + (1 if i >= 3 else 0) + (1 if i >= 6 else 0)
-            tk.Label(grid, text=lab, bg=CARD, fg=MUTED).grid(row=r, column=0, sticky="w", pady=1)
-            v = tk.StringVar(value="-")
-            tk.Label(grid, textvariable=v, bg=CARD, fg=TXT,
-                     font=("Consolas", 11, "bold")).grid(row=r, column=1, sticky="e", padx=(20, 0))
-            self.rep_vars[key] = v
-        tk.Frame(grid, bg=BORDER, height=1).grid(row=4, column=0, columnspan=2, sticky="ew", pady=4)
-        tk.Frame(grid, bg=BORDER, height=1).grid(row=8, column=0, columnspan=2, sticky="ew", pady=4)
+        groups = (("ERRORS", (("Object Lost", "lost"), ("Unexpected Object", "unexpected"),
+                              ("Object Stuck", "stuck"))),
+                  ("TOTALS", (("Total Input", "input"), ("Total Target", "total_target"),
+                              ("Elapsed", "elapsed"))),
+                  ("RATES", (("Target Completion", "completion"), ("System Efficiency", "efficiency"),
+                             ("Reject Rate", "reject_rate"), ("System Loss Rate", "loss"))))
+        r = 0
+        for gname, items in groups:
+            tk.Label(grid, text=gname, bg=CARD, fg=FAINT, font=("Segoe UI", 8, "bold")).grid(
+                row=r, column=0, sticky="w", pady=(10 if r else 0, 2))
+            r += 1
+            for lab, key in items:
+                tk.Label(grid, text=lab, bg=CARD, fg=MUTED,
+                         font=("Segoe UI", 10)).grid(row=r, column=0, sticky="w", pady=2)
+                v = tk.StringVar(value="-")
+                tk.Label(grid, textvariable=v, bg=CARD, fg=TXT,
+                         font=("Consolas", 12, "bold")).grid(row=r, column=1, sticky="e")
+                self.rep_vars[key] = v
+                r += 1
 
         # log
         lg = self._card(self, "LOG")
-        lg.pack(fill="both", expand=True, pady=(6, 14), **pad)
+        lg.pack(fill="both", expand=True, pady=(6, 16), **pad)
         tb = tk.Frame(lg, bg=CARD)
-        tb.place(relx=1.0, x=-12, y=4, anchor="ne")
+        tb.place(relx=1.0, x=-14, y=5, anchor="ne")
         self.auto_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(tb, text="Auto-scroll", variable=self.auto_var, bg=CARD,
-                       fg=MUTED, activebackground=CARD).pack(side="left")
+        tk.Checkbutton(tb, text="Auto-scroll", variable=self.auto_var, bg=CARD, fg=MUTED,
+                       activebackground=CARD, selectcolor=CARD).pack(side="left")
         ttk.Button(tb, text="Clear", width=6,
                    command=lambda: self.log.delete("1.0", "end")).pack(side="left", padx=3)
         ttk.Button(tb, text="Save", width=6, command=self._save_log).pack(side="left")
         wrap = tk.Frame(lg, bg=CARD)
-        wrap.pack(fill="both", expand=True, padx=10, pady=(28, 10))
-        self.log = tk.Text(wrap, height=8, wrap="word", font=("Consolas", 10),
-                           bg="#fafbfc", relief="flat", padx=8, pady=6)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(30, 12))
+        self.log = tk.Text(wrap, height=7, wrap="word", font=("Consolas", 10),
+                           bg="#fafbfc", relief="flat", padx=10, pady=8,
+                           highlightthickness=1, highlightbackground=BORDER)
         sb = ttk.Scrollbar(wrap, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -745,6 +926,7 @@ class App(tk.Tk):
             return
         self._stop_demo()
         self.model.reset_all()
+        self.report_shown = self.model.report_seq
         self.stop_evt.clear()
         threading.Thread(target=self._reader, daemon=True).start()
         self.conn_btn.configure(text="Disconnect")
@@ -778,12 +960,18 @@ class App(tk.Tk):
                 line, buf = buf.split(b"\n", 1)
                 self.q.put(("rx", line.decode("utf-8", "replace").strip("\r")))
 
+    def _cfg(self):
+        out = []
+        for k in ("S", "M", "L", "T (s)"):
+            try:
+                out.append(max(0, self.cfg_vars[k].get()))
+            except tk.TclError:                                  # empty / non-numeric entry
+                self.cfg_vars[k].set(0)
+                out.append(0)
+        return out
+
     def _send_config(self):
-        try:
-            s, m, l, t = (self.cfg_vars[k].get() for k in ("S", "M", "L", "T (s)"))
-        except tk.TclError:
-            messagebox.showwarning("Invalid", "Config values must be integers.")
-            return
+        s, m, l, t = self._cfg()
         if self.demo_iter is not None:
             messagebox.showinfo("Demo running", "Stop the demo first.")
             return
@@ -804,8 +992,9 @@ class App(tk.Tk):
             return
         if self.ser is not None:
             self._disconnect()
-        s, m, l, t = (self.cfg_vars[k].get() for k in ("S", "M", "L", "T (s)"))
+        s, m, l, t = self._cfg()
         self.model.reset_all()
+        self.report_shown = self.model.report_seq
         self.demo_iter = demo_script(s, m, l, t)
         self.demo_btn.configure(text="Stop demo")
         self.link_lbl.configure(text="● Demo mode", fg=ACCENT)
@@ -850,6 +1039,15 @@ class App(tk.Tk):
             with open(p, "w", encoding="utf-8") as f:
                 f.write(self.log.get("1.0", "end"))
 
+    def _show_report(self):
+        if not self.model.report:
+            messagebox.showinfo("No report yet",
+                                "The board has not sent a summary report in this session yet.")
+            return
+        if self.report_win is not None and self.report_win.winfo_exists():
+            self.report_win.destroy()
+        self.report_win = ReportDialog(self, self.model, self._save_log)
+
     def _poll(self):
         changed = False
         try:
@@ -869,6 +1067,10 @@ class App(tk.Tk):
         if changed:
             self.conveyor.sync()
             self._refresh_ui()
+            if self.model.report_seq > self.report_shown:
+                self.report_shown = self.model.report_seq
+                if self.popup_var.get():
+                    self._show_report()
         self.after(50, self._poll)
 
     def _animate(self):
@@ -890,10 +1092,11 @@ class App(tk.Tk):
         if m.remaining is not None:
             self.time_lbl.configure(text=f"{m.remaining} s")
         else:
-            self.time_lbl.configure(text=f"{m.time_limit} s" if m.time_limit and m.state == "READY" else "--")
+            self.time_lbl.configure(
+                text=f"{m.time_limit} s" if m.time_limit and m.state == "READY" else "--")
         self.time_cap.configure(text="TIME LIMIT" if m.state == "READY" else "TIME REMAINING")
         self.pkg_lbl.configure(
-            text=f"Current package   Size: {m.last_size or '-'}    Decision: {m.last_decision or '-'}")
+            text=f"Current package   ·   Size: {m.last_size or '-'}   ·   Decision: {m.last_decision or '-'}")
 
         for k in SIZES:
             big, pb, rj = self.cards[k]
@@ -903,12 +1106,12 @@ class App(tk.Tk):
 
         self.hist.delete("all")
         for i, (sz, dec) in enumerate(m.history):
-            x = 2 + i * 26
-            self.hist.create_rectangle(x, 6, x + 22, 28, fill=SIZE_COLOR[sz], outline="")
-            self.hist.create_text(x + 11, 17, text=sz, fill="white", font=("Segoe UI", 9, "bold"))
+            x = 3 + i * 32
+            self.hist.create_oval(x, 5, x + 28, 33, fill=SIZE_COLOR[sz], outline="")
+            self.hist.create_text(x + 14, 19, text=sz, fill="white", font=("Segoe UI", 11, "bold"))
             if dec == "REJECT":
-                self.hist.create_line(x + 2, 8, x + 20, 26, fill="#111827", width=2)
-                self.hist.create_line(x + 20, 8, x + 2, 26, fill="#111827", width=2)
+                self.hist.create_line(x + 5, 10, x + 23, 28, fill="#ffffff", width=3)
+                self.hist.create_line(x + 23, 10, x + 5, 28, fill="#ffffff", width=3)
 
         for k in ("lost", "unexpected", "stuck"):
             self.rep_vars[k].set(str(m.errors[k]))
