@@ -401,11 +401,11 @@ FAULT_TIMEOUT_S = 10          # FAULT_TIMEOUT_MS
 
 FAULT_INFO = {
     "lost":       ("PACKAGE LOST", "between the IR and LDR sensors",
-                   "IR saw it enter, but it never reached the LDR.\n Press PAUSE (PB5) to resume or RESET (PB3)"),
+                   "IR saw it enter, but it never reached the LDR.\nPress PAUSE (PB5) to resume or RESET (PB3)"),
     "unexpected": ("UNEXPECTED PACKAGE", "at the LDR sensor",
-                   "The LDR triggered without the IR sensor seeing anything first.\n Press PAUSE (PB5) to resume or RESET (PB3) "),
+                   "The LDR triggered without the IR sensor seeing anything first.\nPress PAUSE (PB5) to resume or RESET (PB3) "),
     "stuck":      ("PACKAGE STUCK", "at the LDR sensor",
-                   "The package did not pass the LDR sensor in time, so it was not measured.\n Press PAUSE (PB5) to resume or RESET (PB3)"),
+                   "The package did not pass the LDR sensor in time, so it was not measured.\nPress PAUSE (PB5) to resume or RESET (PB3)"),
     None:         ("FAULT", "on the belt", ""),
 }
 
