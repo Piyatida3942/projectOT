@@ -1,0 +1,74 @@
+--- before/main.c
++++ after/main.c
+@@ -151,7 +151,8 @@
+             case STATE_WAIT_LDR:
+                 if (IS_LDR_DARK()) {
+-                    settle_start_time = msTicks;
+-                    current_state = STATE_SETTLE;
+-                    UART2_TxString("[SENSOR] LDR : Package arrived at sorting point.\r\n");
++                    /* พัสดุถึง LDR แล้ว แต่ยังไม่วัดขนาด: ต้องรอดูก่อนว่าพัสดุผ่าน LDR ไปได้ (ไม่ติด) */
++                    ldr_clear_start_time = msTicks;
++                    current_state = STATE_WAIT_LDR_CLEAR;
++                    UART2_TxString("[SENSOR] LDR : Package detected at LDR sensor. Checking for jam...\r\n");
+                 }
+                 else if ((msTicks - wait_ldr_start_time) >= LDR_TIMEOUT_MS) {
+@@ -237,14 +238,5 @@
+             case STATE_ROUTE_REJECT:
+                 if ((msTicks - route_start_time) >= ROUTE_TIME_MS) {
+-                    ldr_clear_start_time = msTicks;
+-                    current_state = STATE_WAIT_LDR_CLEAR;
+-                }
+-                else {
+-                    /* No action */
+-                }
+-                break;
+-
+-            case STATE_WAIT_LDR_CLEAR:
+-                if (!IS_LDR_DARK()) {
++                    /* พัสดุผ่านการตรวจ stuck และถูกคัดแยกลงกล่องแล้ว -> นับผลตอนนี้ */
+                     if (current_decision == DECISION_ACCEPT) {
+                         if (current_size == SIZE_S) {
+@@ -279,4 +271,16 @@
+                         current_state = STATE_RUNNING;
+                     }
++                }
++                else {
++                    /* No action */
++                }
++                break;
++
++            case STATE_WAIT_LDR_CLEAR:
++                /* ตรวจ stuck ก่อนวัดขนาด: พัสดุต้องผ่าน LDR ไป (LDR สว่างอีกครั้ง) ภายใน LDR_CLEAR_TIMEOUT_MS */
++                if (!IS_LDR_DARK()) {
++                    settle_start_time = msTicks;
++                    current_state = STATE_SETTLE;
++                    UART2_TxString("[SENSOR] LDR : Package passed LDR sensor. No jam detected.\r\n");
+                 }
+                 else if ((msTicks - ldr_clear_start_time) >= LDR_CLEAR_TIMEOUT_MS) {
+--- before/sorter.c
++++ after/sorter.c
+@@ -104,5 +104,5 @@
+     }
+     else {
+-        UART2_TxString("\r\n[FAULT] Package STUCK at sorting zone!\r\n");
++        UART2_TxString("\r\n[FAULT] Package STUCK at LDR sensor!\r\n");
+     }
+ 
+--- before/app_config.h
++++ after/app_config.h
+@@ -55,6 +55,6 @@
+ #define IR_COOLDOWN_MS        500u
+ #define LDR_TIMEOUT_MS        5000u      /* รอ LDR ตรวจพบวัตถุสูงสุด 5 วินาที */
+-#define LDR_CLEAR_TIMEOUT_MS  3000u      /* รอวัตถุออกจาก LDR สูงสุด 3 วินาที */
+-#define SETTLE_TIME_MS        300u
++#define LDR_CLEAR_TIMEOUT_MS  3000u      /* ตรวจ stuck: รอพัสดุผ่าน LDR (LDR สว่างอีกครั้ง) สูงสุด 3 วินาที ก่อนวัดขนาด */
++#define SETTLE_TIME_MS        300u       /* รอพัสดุนิ่ง หลังผ่านการตรวจ stuck แล้ว ก่อนวัดขนาด */
+ #define ROUTE_TIME_MS         400u       /* เวลาให้วัตถุเคลื่อนผ่านเซอโว */
+ #define PAUSE_TIMEOUT_MS      10000u     /* Pause ค้างไว้เกิน 10s จะตัดเข้า Report */
+@@ -82,5 +82,5 @@
+     STATE_RUNNING,
+     STATE_WAIT_LDR,
+-    STATE_SETTLE,
++    STATE_SETTLE,            /* ลำดับจริง: WAIT_LDR -> WAIT_LDR_CLEAR (ตรวจ stuck) -> SETTLE -> EVALUATE */
+     STATE_EVALUATE,
+     STATE_ROUTE_ACCEPT,
